@@ -1,0 +1,25 @@
+name: semeval2026
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pandas
+  - numpy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - tqdm
+  - pyarrow
+  - fastparquet
+  - python-dotenv
+  - pip:
+      - kaggle
+      - transformers>=4.40.0
+      - datasets>=2.19.0
+      - torch>=2.2.0
+      - accelerate>=0.29.0
+      - evaluate>=0.4.1
+      - sentencepiece
+      - protobuf

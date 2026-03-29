@@ -552,6 +552,8 @@ if __name__ == "__main__":
     cache_dir = Path(cfg.output_dir)
 
     def get_or_cache_features(df, name, code_col="code"):
+        if len(df) == 0:
+            return np.empty((0, 13), dtype=np.float32)
         cache = cache_dir / f"expert_feats_{name}.npy"
         if cache.exists():
             print(f"  Loaded cached: {cache.name}")

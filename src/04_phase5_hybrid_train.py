@@ -90,11 +90,12 @@ IN_KAGGLE = "kaggle_secrets" in sys.modules or os.path.exists("/kaggle/working")
 IN_COLAB = "google.colab" in sys.modules or os.path.exists("/content")
 
 if IN_KAGGLE:
-    base_k = Path("/kaggle/input/sem-eval-2026-task-13-subtask-a")
-    if (base_k / "Task_A").exists():
-        d_dir = str(base_k / "Task_A")
+    import glob
+    search_paths = glob.glob("/kaggle/input/**/*.parquet", recursive=True)
+    if search_paths:
+        d_dir = str(Path(search_paths[0]).parent)
     else:
-        d_dir = str(base_k)
+        d_dir = "/kaggle/input/semeval-2026-task13/SemEval-2026-Task13/task_a"
     cfg = Config(data_dir=d_dir, output_dir="/kaggle/working/outputs_p5")
 elif IN_COLAB:
     cfg = Config(data_dir="/content/data", output_dir="/content/outputs_p5")
@@ -530,6 +531,7 @@ if __name__ == "__main__":
 
     # ── 7.1 Load data ──
     print("\n[1/6] Loading data...")
+    data_dir = Path(cfg.data_dir)
     train_path = data_dir / "task_a_training_set_1.parquet" if (data_dir / "task_a_training_set_1.parquet").exists() else data_dir / "train.parquet"
     val_path   = data_dir / "task_a_validation_set.parquet" if (data_dir / "task_a_validation_set.parquet").exists() else data_dir / "validation.parquet"
     test_path  = data_dir / "test.parquet"

@@ -91,11 +91,16 @@ IN_COLAB = "google.colab" in sys.modules or os.path.exists("/content")
 
 if IN_KAGGLE:
     import glob
-    search_paths = glob.glob("/kaggle/input/**/*.parquet", recursive=True)
+    # Ưu tiên tìm file train.parquet gốc từ giải đấu chính thức
+    search_paths = glob.glob("/kaggle/input/**/train.parquet", recursive=True)
+    if not search_paths:
+        # Nếu không có, tìm bất kỳ file parquet nào (dành cho fallback)
+        search_paths = glob.glob("/kaggle/input/**/*.parquet", recursive=True)
+        
     if search_paths:
         d_dir = str(Path(search_paths[0]).parent)
     else:
-        d_dir = "/kaggle/input/semeval-2026-task13/SemEval-2026-Task13/task_a"
+        d_dir = "/kaggle/input/sem-eval-2026-task-13-subtask-a/Task_A"
     cfg = Config(data_dir=d_dir, output_dir="/kaggle/working/outputs_p5")
 elif IN_COLAB:
     cfg = Config(data_dir="/content/data", output_dir="/content/outputs_p5")

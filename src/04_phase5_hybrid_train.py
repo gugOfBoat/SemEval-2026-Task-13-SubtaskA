@@ -521,7 +521,86 @@ def evaluate(model, loader, device, cfg):
 
 
 # ============================================================================
-# 7. MAIN PIPELINE
+# 7. INFERENCE ENGINE
+# ============================================================================
+
+class HybridInferencer:
+    """Class dùng để load weights và chạy inference mà không cần train lại."""
+    def __init__(self, model_dir, backbone_name, device, max_length=512, n_folds=2):
+        from transformers import AutoTokenizer
+        self.model_dir = Path(model_dir)
+        self.device = device
+        self.max_length = max_length
+        self.n_folds = n_folds
+        
+        # 1. Load XGBoost model
+        xgb_path = self.model_dir / "xgb_for_p5.pkl"
+        if not xgb_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy XGBoost model tại {xgb_path}")
+        with open(xgb_path, "rb") as f:
+            xgb_m = pickle.load(f)
+            self.xgb_model = xgb_m.get("model", xgb_m)
+            if isinstance(self.xgb_model, dict):
+                self.xgb_model = self.xgb_model.get("models", [self.xgb_model])[0]
+                
+        # 2. Load Scaler
+        scaler_path = self.model_dir / "zscore_scaler.pkl"
+        if not scaler_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy scaler tại {scaler_path}")
+        with open(scaler_path, "rb") as f:
+            self.scaler = pickle.load(f)
+            
+        # 3. Load Tokenizer
+        print(f"Loading tokenizer: {backbone_name}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(backbone_name)
+        
+        # 4. Load PyTorch models
+        print(f"Loading {n_folds} PyTorch folds...")
+        self.models = []
+        for fold in range(1, n_folds + 1):
+            model = HybridFusionModel(
+                backbone_name, expert_input_dim=14, expert_hidden_dim=64, projection_dim=128, dropout=0.1
+            ).to(self.device)
+            fold_pt = self.model_dir / "fold_models" / f"fold{fold}_best.pt"
+            if not fold_pt.exists():
+                raise FileNotFoundError(f"Không tìm thấy weight list tại {fold_pt}")
+            model.load_state_dict(torch.load(fold_pt, map_location=self.device, weights_only=True))
+            model.eval()
+            self.models.append(model)
+        print("Inference engine ready.")
+
+    @torch.no_grad()
+    def predict(self, codes: list, batch_size=32):
+        print(f"Extracting features for {len(codes)} samples...")
+        from tqdm.auto import tqdm
+        feats = np.stack([extract_13_features(c) for c in tqdm(codes, desc="13 Features", leave=False)])
+        xgb_prob = self.xgb_model.predict_proba(feats)[:, 1].reshape(-1, 1)
+        expert = np.hstack([feats, xgb_prob])
+        expert = self.scaler.transform(expert).astype(np.float32)
+        
+        ds = HybridCodeDataset(codes, expert, None, self.tokenizer, self.max_length)
+        dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        
+        test_probs = np.zeros(len(codes))
+        for i, model in enumerate(self.models, 1):
+            print(f"Predicting with fold {i}/{self.n_folds}...")
+            all_probs = []
+            for batch in tqdm(dl, leave=False, desc=f"Fold {i}"):
+                input_ids = batch["input_ids"].to(self.device)
+                attn_mask = batch["attention_mask"].to(self.device)
+                exp = batch["expert_feats"].to(self.device)
+                
+                with torch.cuda.amp.autocast(enabled=True):
+                    logits, _ = model(input_ids, attn_mask, exp)
+                probs = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
+                all_probs.append(probs)
+                
+            test_probs += np.concatenate(all_probs) / len(self.models)
+            
+        return test_probs
+
+# ============================================================================
+# 8. MAIN PIPELINE
 # ============================================================================
 
 if __name__ == "__main__":
@@ -531,6 +610,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SemEval-2026 Task 13 Hybrid Training")
     parser.add_argument("--data_dir", type=str, default=None, help="Đường dẫn thư mục chứa dataset")
     parser.add_argument("--output_dir", type=str, default=None, help="Đường dẫn thư mục lưu output")
+    parser.add_argument("--model_dir", type=str, default=None, help="Đường dẫn thư mục chứa model weights (nếu khác output_dir)")
+    parser.add_argument("--inference_only", action="store_true", help="Chỉ load weights và chạy predict (không train)")
     args, _ = parser.parse_known_args()
 
     if args.data_dir: cfg.data_dir = args.data_dir
@@ -546,7 +627,42 @@ if __name__ == "__main__":
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    # ── 7.1 Load data ──
+    # --- INFERENCE ONLY MODE ---
+    if args.inference_only:
+        print("\n=== RUNNING INFERENCE ONLY ===")
+        model_dir = args.model_dir if args.model_dir else cfg.output_dir
+        inferencer = HybridInferencer(model_dir, cfg.backbone_name, device, cfg.max_length, cfg.n_folds)
+        
+        data_dir = Path(cfg.data_dir)
+        test_path  = data_dir / "test.parquet"
+        
+        if test_path.exists():
+            print(f"Reading {test_path}...")
+            df_test  = pd.read_parquet(test_path)
+            probs = inferencer.predict(df_test["code"].values, batch_size=cfg.batch_size * 2)
+            
+            submission = pd.DataFrame({
+                "ID": df_test["ID"].values,
+                "label": (probs > 0.5).astype(int),
+            })
+            
+            sub_path = Path("/kaggle/working/submission.csv") if IN_KAGGLE else Path(model_dir) / "submission.csv"
+            submission.to_csv(sub_path, index=False)
+            
+            pd.DataFrame({
+                "ID": df_test["ID"].values,
+                "prob_ai": probs,
+                "label": (probs > 0.5).astype(int),
+            }).to_parquet(Path(model_dir) / "test_preds_p5.parquet", index=False)
+            
+            print(f"\n[DONE] Lưu file submission tại: {sub_path}")
+            print(f"Predicted AI ratio: {(probs > 0.5).mean():.4f}")
+        else:
+            print(f"[WARN] Không tìm thấy file {test_path} để inference.")
+            
+        sys.exit(0)
+
+    # ── 8.1 Load data ──
     print("\n[1/6] Loading data...")
     data_dir = Path(cfg.data_dir)
     train_path = data_dir / "train.parquet"

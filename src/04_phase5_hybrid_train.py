@@ -1,21 +1,29 @@
 """
-Phase 5: Hybrid Deep Feature Fusion + Contrastive Learning
-===========================================================
+Phase 5: Hybrid Deep Feature Fusion + Contrastive Learning (v2)
+================================================================
 SemEval-2026 Task 13 SubtaskA — AI-Generated Code Detection
 
 Architecture:
-    Semantic Branch (CodeBERT/DeBERTa) ──> CLS [768]
-                                                  ├──> Concat [768+64] ──> Classifier
-    Expert Branch (13 feats + XGB prob) ──> MLP [64]
+    Semantic Branch (CodeBERT/DeBERTa) --> CLS [768]
+                                                  ├--> Concat [768+64] --> Classifier
+    Expert Branch (13 feats + XGB prob) --> MLP [64]
 
 Loss: L = alpha * SupCon + (1 - alpha) * CrossEntropy
 
-Designed for: Google Colab T4 GPU (16 GB VRAM)
+Chiến lược v2 (Kaggle 12h T4):
+    - Bỏ K-Fold → train 1 lần trên train set, validate trên validation set
+    - Balanced Ensemble: train N models trên các balanced subsets khác nhau
+    - Progressive Unfreezing: freeze backbone epoch 1-2, unfreeze epoch 3+
+    - Early Stopping theo val_AUC (patience=2)
+    - Subsample 50K mỗi subset × 3 models = tổng 150K samples
 
-Usage on Colab:
+Usage on Kaggle:
     !pip install transformers accelerate xgboost tree-sitter \
          tree-sitter-python tree-sitter-java tree-sitter-cpp -q
-    %run src/04_phase5_hybrid_train.py
+    !python src/04_phase5_hybrid_train.py
+
+    # Inference only (load weights đã train):
+    !python src/04_phase5_hybrid_train.py --inference_only --model_dir /kaggle/working
 """
 
 import os, sys, gc, math, time, pickle, re, zlib, warnings
@@ -30,7 +38,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, f1_score, classification_report
 from sklearn.preprocessing import StandardScaler
 from tqdm.auto import tqdm
@@ -53,7 +60,11 @@ class Config:
 
     # -- Data --
     max_length: int = 512                      # Token limit (covers ~95% samples)
-    train_sample: int = 0                      # 0 = use all; set e.g. 100000 for quick test
+    train_sample: int = 50_000                 # Mỗi balanced subset = 50K (25K per class)
+
+    # -- Ensemble --
+    n_ensemble: int = 3                        # Số models trong ensemble
+    # Mỗi model train trên 1 balanced subset khác nhau (seed khác nhau)
 
     # -- Model --
     expert_input_dim: int = 14                 # 13 features + 1 XGB probability
@@ -62,17 +73,18 @@ class Config:
     dropout: float = 0.1
 
     # -- Training --
-    n_folds: int = 2
-    epochs: int = 1
-    batch_size: int = 16                       # Per-GPU batch
-    grad_accum_steps: int = 4                  # Effective batch = 16*4 = 64
-    lr_backbone: float = 1e-5                  # Differential LR
-    lr_head: float = 1e-4
+    epochs: int = 3                            # 3 epochs per model
+    freeze_backbone_epochs: int = 2            # Freeze CodeBERT 2 epochs đầu
+    batch_size: int = 32                       # Per-GPU batch (tăng từ 16)
+    grad_accum_steps: int = 2                  # Effective batch = 32*2 = 64
+    lr_backbone: float = 1e-5                  # Differential LR (chỉ dùng khi unfreeze)
+    lr_head: float = 1e-3                      # Head lr cao hơn khi freeze backbone
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
     fp16: bool = True                          # Mixed precision
     supcon_alpha: float = 0.3                  # Loss weight: alpha*SupCon + (1-a)*CE
     supcon_temperature: float = 0.07
+    early_stop_patience: int = 2               # Patience cho early stopping
     seed: int = 42
 
     # -- 13 Selected Features (from FEATURE_SELECTION.md) --
@@ -91,12 +103,9 @@ IN_COLAB = "google.colab" in sys.modules or os.path.exists("/content")
 
 if IN_KAGGLE:
     import glob
-    # Ưu tiên tìm file train.parquet gốc từ giải đấu chính thức
     search_paths = glob.glob("/kaggle/input/**/train.parquet", recursive=True)
     if not search_paths:
-        # Nếu không có, tìm bất kỳ file parquet nào (dành cho fallback)
         search_paths = glob.glob("/kaggle/input/**/*.parquet", recursive=True)
-        
     if search_paths:
         d_dir = str(Path(search_paths[0]).parent)
     else:
@@ -113,7 +122,8 @@ else:
 
 os.makedirs(cfg.output_dir, exist_ok=True)
 print(f"Config: backbone={cfg.backbone_name}, batch={cfg.batch_size}, "
-      f"accum={cfg.grad_accum_steps}, epochs={cfg.epochs}, folds={cfg.n_folds}")
+      f"accum={cfg.grad_accum_steps}, epochs={cfg.epochs}, "
+      f"ensemble={cfg.n_ensemble}, sample={cfg.train_sample}")
 print(f"Data:   {cfg.data_dir}")
 print(f"Output: {cfg.output_dir}")
 
@@ -237,7 +247,50 @@ def extract_features_batch(codes: list) -> np.ndarray:
 
 
 # ============================================================================
-# 3. DATASET
+# 3. BALANCED SAMPLING
+# ============================================================================
+
+def create_balanced_subset(df, sample_size, seed):
+    """Tạo balanced subset với 50/50 human/AI.
+    
+    Args:
+        df: DataFrame có cột 'label' (0=human, 1=AI), index phải là 0..N-1
+        sample_size: tổng số samples mong muốn
+        seed: random seed (mỗi ensemble member dùng seed khác nhau)
+    
+    Returns:
+        (DataFrame balanced subset với reset index, 
+         np.array original_indices để map expert features)
+    """
+    per_class = sample_size // 2
+    
+    df_human = df[df["label"] == 0]
+    df_ai = df[df["label"] == 1]
+    
+    n_human = min(per_class, len(df_human))
+    n_ai = min(per_class, len(df_ai))
+    
+    # Nếu 1 class ít hơn, giảm class kia cho cân bằng
+    n_each = min(n_human, n_ai)
+    
+    subset_human = df_human.sample(n_each, random_state=seed)
+    subset_ai = df_ai.sample(n_each, random_state=seed)
+    
+    balanced = pd.concat([subset_human, subset_ai]).sample(
+        frac=1.0, random_state=seed  # Shuffle
+    )
+    
+    # Lưu original indices TRƯỚC khi reset
+    original_indices = balanced.index.values.copy()
+    balanced = balanced.reset_index(drop=True)
+    
+    print(f"  Balanced subset (seed={seed}): {len(balanced):,} samples "
+          f"({n_each:,} human + {n_each:,} AI)")
+    return balanced, original_indices
+
+
+# ============================================================================
+# 4. DATASET
 # ============================================================================
 
 class HybridCodeDataset(Dataset):
@@ -274,7 +327,7 @@ class HybridCodeDataset(Dataset):
 
 
 # ============================================================================
-# 4. MODEL — Hybrid Feature Fusion
+# 5. MODEL — Hybrid Feature Fusion
 # ============================================================================
 
 class ExpertBranch(nn.Module):
@@ -333,6 +386,18 @@ class HybridFusionModel(nn.Module):
             nn.Linear(fused_dim, 2),
         )
 
+    def freeze_backbone(self):
+        """Freeze tất cả params của backbone (CodeBERT)."""
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        print("  [Freeze] Backbone frozen — chỉ train head")
+
+    def unfreeze_backbone(self):
+        """Unfreeze backbone để fine-tune."""
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+        print("  [Unfreeze] Backbone unfrozen — fine-tune toàn bộ")
+
     def forward(self, input_ids, attention_mask, expert_feats):
         # Semantic branch: CLS token (index 0)
         outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
@@ -352,50 +417,33 @@ class HybridFusionModel(nn.Module):
 
 
 # ============================================================================
-# 5. LOSSES
+# 6. LOSSES
 # ============================================================================
 
 class SupConLoss(nn.Module):
-    """Supervised Contrastive Loss (Khosla et al., 2020).
-
-    Pulls same-label samples together, pushes different-label apart
-    in embedding space. Key for OOD robustness.
-    """
+    """Supervised Contrastive Loss (Khosla et al., 2020)."""
     def __init__(self, temperature=0.07):
         super().__init__()
         self.temperature = temperature
 
     def forward(self, embeddings, labels):
-        """
-        Args:
-            embeddings: (B, dim) L2-normalized embeddings
-            labels: (B,) integer labels
-        Returns:
-            scalar loss
-        """
         device = embeddings.device
         B = embeddings.shape[0]
         if B <= 1:
             return torch.tensor(0.0, device=device)
 
-        # Cosine similarity matrix
-        sim = torch.matmul(embeddings, embeddings.T) / self.temperature  # (B, B)
-
-        # Mask: same label = 1, different = 0 (exclude self)
+        sim = torch.matmul(embeddings, embeddings.T) / self.temperature
         labels = labels.view(-1, 1)
-        mask = (labels == labels.T).float().to(device)       # (B, B)
+        mask = (labels == labels.T).float().to(device)
         self_mask = torch.eye(B, device=device)
-        mask = mask - self_mask                               # Remove diagonal
+        mask = mask - self_mask
 
-        # For numerical stability
         logits_max, _ = sim.max(dim=1, keepdim=True)
         sim = sim - logits_max.detach()
 
-        # Log-softmax over all non-self entries
-        exp_sim = torch.exp(sim) * (1 - self_mask)            # Zero out self
+        exp_sim = torch.exp(sim) * (1 - self_mask)
         log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-8)
 
-        # Mean over positive pairs
         pos_count = mask.sum(dim=1).clamp(min=1)
         loss = -(mask * log_prob).sum(dim=1) / pos_count
 
@@ -418,7 +466,7 @@ class HybridLoss(nn.Module):
 
 
 # ============================================================================
-# 6. TRAINING ENGINE
+# 7. TRAINING ENGINE
 # ============================================================================
 
 def set_seed(seed):
@@ -428,21 +476,27 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def get_optimizer(model, cfg):
+def get_optimizer(model, cfg, backbone_frozen=False):
     """Differential learning rates: backbone slower, head faster."""
     backbone_params = []
     head_params = []
 
     for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
         if "backbone" in name:
             backbone_params.append(param)
         else:
             head_params.append(param)
 
-    return torch.optim.AdamW([
-        {"params": backbone_params, "lr": cfg.lr_backbone, "weight_decay": cfg.weight_decay},
-        {"params": head_params,     "lr": cfg.lr_head,     "weight_decay": cfg.weight_decay},
-    ])
+    groups = []
+    if backbone_params and not backbone_frozen:
+        groups.append({"params": backbone_params, "lr": cfg.lr_backbone,
+                       "weight_decay": cfg.weight_decay})
+    groups.append({"params": head_params, "lr": cfg.lr_head,
+                   "weight_decay": cfg.weight_decay})
+
+    return torch.optim.AdamW(groups)
 
 
 def get_scheduler(optimizer, num_training_steps, warmup_ratio=0.1):
@@ -487,10 +541,11 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler,
         total_ce += lce.item()
         total_sc += lsc.item()
         steps += 1
-        pbar.set_postfix(loss=f"{total_loss/steps:.4f}",
-                         ce=f"{total_ce/steps:.4f}", sc=f"{total_sc/steps:.4f}")
+        if steps % 50 == 0:
+            pbar.set_postfix(loss=f"{total_loss/steps:.4f}",
+                             ce=f"{total_ce/steps:.4f}", sc=f"{total_sc/steps:.4f}")
 
-    return total_loss / steps
+    return total_loss / max(steps, 1)
 
 
 @torch.no_grad()
@@ -520,54 +575,191 @@ def evaluate(model, loader, device, cfg):
     return all_probs, None, None
 
 
+def train_single_model(model_idx, df_train_subset, expert_train_subset,
+                       codes_val, expert_val, labels_val,
+                       tokenizer, device, cfg, save_dir):
+    """Train 1 model trên 1 balanced subset, trả về best val_AUC."""
+
+    print(f"\n{'='*60}")
+    print(f"  ENSEMBLE MODEL {model_idx}/{cfg.n_ensemble}")
+    print(f"  Train: {len(df_train_subset):,}, Val: {len(codes_val):,}")
+    print(f"{'='*60}")
+
+    model_path = save_dir / f"model{model_idx}_best.pt"
+
+    # Kiểm tra checkpoint
+    if model_path.exists():
+        print(f"  [Resume] Model {model_idx} đã train. Bỏ qua...")
+        model = HybridFusionModel(
+            cfg.backbone_name, cfg.expert_input_dim,
+            cfg.expert_hidden_dim, cfg.projection_dim, cfg.dropout,
+        ).to(device)
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        
+        val_ds = HybridCodeDataset(codes_val, expert_val, labels_val, tokenizer, cfg.max_length)
+        val_dl = DataLoader(val_ds, batch_size=cfg.batch_size * 2, shuffle=False,
+                            num_workers=2, pin_memory=True)
+        _, val_auc, val_f1 = evaluate(model, val_dl, device, cfg)
+        print(f"  Resumed model {model_idx}: val_AUC={val_auc:.4f}, val_F1={val_f1:.4f}")
+        del model, val_ds, val_dl
+        gc.collect(); torch.cuda.empty_cache()
+        return val_auc
+
+    # Datasets
+    codes_tr = df_train_subset["code"].values
+    labels_tr = df_train_subset["label"].values
+
+    ds_tr = HybridCodeDataset(codes_tr, expert_train_subset, labels_tr,
+                              tokenizer, cfg.max_length)
+    ds_va = HybridCodeDataset(codes_val, expert_val, labels_val,
+                              tokenizer, cfg.max_length)
+
+    dl_tr = DataLoader(ds_tr, batch_size=cfg.batch_size, shuffle=True,
+                       num_workers=2, pin_memory=True, drop_last=True)
+    dl_va = DataLoader(ds_va, batch_size=cfg.batch_size * 2, shuffle=False,
+                       num_workers=2, pin_memory=True)
+
+    # Model
+    model = HybridFusionModel(
+        cfg.backbone_name, cfg.expert_input_dim,
+        cfg.expert_hidden_dim, cfg.projection_dim, cfg.dropout,
+    ).to(device)
+
+    # Gradient checkpointing (saves VRAM)
+    if hasattr(model.backbone, "gradient_checkpointing_enable"):
+        model.backbone.gradient_checkpointing_enable()
+
+    # Criterion
+    criterion = HybridLoss(alpha=cfg.supcon_alpha,
+                           temperature=cfg.supcon_temperature)
+
+    best_auc = 0; patience = 0
+
+    for epoch in range(1, cfg.epochs + 1):
+        t0 = time.time()
+
+        # === Progressive Unfreezing ===
+        if epoch <= cfg.freeze_backbone_epochs:
+            backbone_frozen = True
+            if epoch == 1:
+                model.freeze_backbone()
+        else:
+            backbone_frozen = False
+            if epoch == cfg.freeze_backbone_epochs + 1:
+                model.unfreeze_backbone()
+
+        # Re-create optimizer khi thay đổi freeze state
+        if epoch == 1 or epoch == cfg.freeze_backbone_epochs + 1:
+            optimizer = get_optimizer(model, cfg, backbone_frozen)
+            remaining_epochs = cfg.epochs - epoch + 1
+            total_steps = (len(dl_tr) // cfg.grad_accum_steps) * remaining_epochs
+            scheduler = get_scheduler(optimizer, total_steps, cfg.warmup_ratio)
+            scaler = torch.cuda.amp.GradScaler(enabled=cfg.fp16)
+
+        # Train
+        train_loss = train_one_epoch(
+            model, dl_tr, criterion, optimizer, scheduler, scaler,
+            device, cfg, epoch)
+
+        # Validate
+        val_probs, val_auc, val_f1 = evaluate(model, dl_va, device, cfg)
+        elapsed = time.time() - t0
+
+        frozen_str = " [FROZEN]" if backbone_frozen else " [FULL]"
+        print(f"  Epoch {epoch}{frozen_str}: loss={train_loss:.4f}, "
+              f"val_AUC={val_auc:.4f}, val_F1={val_f1:.4f}, "
+              f"time={elapsed:.0f}s")
+
+        # Check AI prediction ratio
+        pred_labels = (val_probs > 0.5).astype(int)
+        ai_ratio = pred_labels.mean()
+        print(f"    → Predicted AI ratio on val: {ai_ratio:.4f} "
+              f"(actual: {labels_val.mean():.4f})")
+
+        # Early stopping
+        if val_auc > best_auc:
+            best_auc = val_auc
+            patience = 0
+            torch.save(model.state_dict(), model_path)
+            print(f"    → Saved best model (AUC={best_auc:.4f})")
+        else:
+            patience += 1
+            if patience >= cfg.early_stop_patience:
+                print(f"  Early stop at epoch {epoch} (patience={patience})")
+                break
+
+    # Cleanup
+    del model, optimizer, scheduler, scaler, ds_tr, ds_va, dl_tr, dl_va
+    gc.collect(); torch.cuda.empty_cache()
+
+    print(f"  Model {model_idx} done: best_AUC={best_auc:.4f}")
+    return best_auc
+
+
 # ============================================================================
-# 7. INFERENCE ENGINE
+# 8. INFERENCE ENGINE
 # ============================================================================
 
 class HybridInferencer:
-    """Class dùng để load weights và chạy inference mà không cần train lại."""
-    def __init__(self, model_dir, backbone_name, device, max_length=512, n_folds=2):
+    """Load trained ensemble weights và chạy inference."""
+    def __init__(self, model_dir, backbone_name, device, max_length=512, n_ensemble=3):
         from transformers import AutoTokenizer
         self.model_dir = Path(model_dir)
         self.device = device
         self.max_length = max_length
-        self.n_folds = n_folds
-        
+        self.n_ensemble = n_ensemble
+
         # 1. Load XGBoost model
         xgb_path = self.model_dir / "xgb_for_p5.pkl"
         if not xgb_path.exists():
             raise FileNotFoundError(f"Không tìm thấy XGBoost model tại {xgb_path}")
         with open(xgb_path, "rb") as f:
             xgb_m = pickle.load(f)
-            self.xgb_model = xgb_m.get("model", xgb_m)
+            self.xgb_model = xgb_m.get("model", xgb_m) if isinstance(xgb_m, dict) else xgb_m
             if isinstance(self.xgb_model, dict):
                 self.xgb_model = self.xgb_model.get("models", [self.xgb_model])[0]
-                
+
         # 2. Load Scaler
         scaler_path = self.model_dir / "zscore_scaler.pkl"
         if not scaler_path.exists():
             raise FileNotFoundError(f"Không tìm thấy scaler tại {scaler_path}")
         with open(scaler_path, "rb") as f:
             self.scaler = pickle.load(f)
-            
+
         # 3. Load Tokenizer
         print(f"Loading tokenizer: {backbone_name}...")
         self.tokenizer = AutoTokenizer.from_pretrained(backbone_name)
+
+        # 4. Load PyTorch models (ensemble)
+        models_dir = self.model_dir / "ensemble_models"
+        # Fallback: check old fold_models too
+        if not models_dir.exists():
+            models_dir = self.model_dir / "fold_models"
         
-        # 4. Load PyTorch models
-        print(f"Loading {n_folds} PyTorch folds...")
         self.models = []
-        for fold in range(1, n_folds + 1):
+        for i in range(1, n_ensemble + 1):
             model = HybridFusionModel(
-                backbone_name, expert_input_dim=14, expert_hidden_dim=64, projection_dim=128, dropout=0.1
+                backbone_name, expert_input_dim=14, expert_hidden_dim=64,
+                projection_dim=128, dropout=0.1
             ).to(self.device)
-            fold_pt = self.model_dir / "fold_models" / f"fold{fold}_best.pt"
-            if not fold_pt.exists():
-                raise FileNotFoundError(f"Không tìm thấy weight list tại {fold_pt}")
-            model.load_state_dict(torch.load(fold_pt, map_location=self.device, weights_only=True))
+            
+            # Try ensemble path first, then fold path
+            model_pt = self.model_dir / "ensemble_models" / f"model{i}_best.pt"
+            if not model_pt.exists():
+                model_pt = self.model_dir / "fold_models" / f"fold{i}_best.pt"
+            if not model_pt.exists():
+                print(f"  [WARN] Không tìm thấy model {i}, bỏ qua...")
+                del model
+                continue
+                
+            print(f"  Loading {model_pt.name}...")
+            model.load_state_dict(torch.load(model_pt, map_location=self.device, weights_only=True))
             model.eval()
             self.models.append(model)
-        print("Inference engine ready.")
+        
+        if not self.models:
+            raise FileNotFoundError("Không tìm thấy bất kỳ model nào!")
+        print(f"Inference engine ready ({len(self.models)} models).")
 
     @torch.no_grad()
     def predict(self, codes: list, batch_size=32):
@@ -577,45 +769,57 @@ class HybridInferencer:
         xgb_prob = self.xgb_model.predict_proba(feats)[:, 1].reshape(-1, 1)
         expert = np.hstack([feats, xgb_prob])
         expert = self.scaler.transform(expert).astype(np.float32)
-        
+
         ds = HybridCodeDataset(codes, expert, None, self.tokenizer, self.max_length)
         dl = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-        
+
         test_probs = np.zeros(len(codes))
         for i, model in enumerate(self.models, 1):
-            print(f"Predicting with fold {i}/{self.n_folds}...")
+            print(f"Predicting with model {i}/{len(self.models)}...")
             all_probs = []
-            for batch in tqdm(dl, leave=False, desc=f"Fold {i}"):
+            for batch in tqdm(dl, leave=False, desc=f"Model {i}"):
                 input_ids = batch["input_ids"].to(self.device)
                 attn_mask = batch["attention_mask"].to(self.device)
                 exp = batch["expert_feats"].to(self.device)
-                
+
                 with torch.cuda.amp.autocast(enabled=True):
                     logits, _ = model(input_ids, attn_mask, exp)
                 probs = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
                 all_probs.append(probs)
-                
+
             test_probs += np.concatenate(all_probs) / len(self.models)
-            
+
         return test_probs
 
+
 # ============================================================================
-# 8. MAIN PIPELINE
+# 9. MAIN PIPELINE
 # ============================================================================
 
 if __name__ == "__main__":
     import argparse
     from transformers import AutoTokenizer
 
-    parser = argparse.ArgumentParser(description="SemEval-2026 Task 13 Hybrid Training")
-    parser.add_argument("--data_dir", type=str, default=None, help="Đường dẫn thư mục chứa dataset")
-    parser.add_argument("--output_dir", type=str, default=None, help="Đường dẫn thư mục lưu output")
-    parser.add_argument("--model_dir", type=str, default=None, help="Đường dẫn thư mục chứa model weights (nếu khác output_dir)")
-    parser.add_argument("--inference_only", action="store_true", help="Chỉ load weights và chạy predict (không train)")
+    parser = argparse.ArgumentParser(description="SemEval-2026 Task 13 Hybrid Training v2")
+    parser.add_argument("--data_dir", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--model_dir", type=str, default=None,
+                        help="Đường dẫn chứa model weights (cho inference)")
+    parser.add_argument("--inference_only", action="store_true",
+                        help="Chỉ chạy inference, không train")
+    parser.add_argument("--train_sample", type=int, default=None,
+                        help="Số samples mỗi balanced subset (default: 50000)")
+    parser.add_argument("--n_ensemble", type=int, default=None,
+                        help="Số models trong ensemble (default: 3)")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Số epochs per model (default: 3)")
     args, _ = parser.parse_known_args()
 
     if args.data_dir: cfg.data_dir = args.data_dir
     if args.output_dir: cfg.output_dir = args.output_dir
+    if args.train_sample: cfg.train_sample = args.train_sample
+    if args.n_ensemble: cfg.n_ensemble = args.n_ensemble
+    if args.epochs: cfg.epochs = args.epochs
 
     os.makedirs(cfg.output_dir, exist_ok=True)
     print(f"\n[CLI Overrides] Data: {cfg.data_dir} | Output: {cfg.output_dir}")
@@ -631,56 +835,57 @@ if __name__ == "__main__":
     if args.inference_only:
         print("\n=== RUNNING INFERENCE ONLY ===")
         model_dir = args.model_dir if args.model_dir else cfg.output_dir
-        inferencer = HybridInferencer(model_dir, cfg.backbone_name, device, cfg.max_length, cfg.n_folds)
-        
+        inferencer = HybridInferencer(
+            model_dir, cfg.backbone_name, device, cfg.max_length, cfg.n_ensemble)
+
         data_dir = Path(cfg.data_dir)
-        test_path  = data_dir / "test.parquet"
-        
+        test_path = data_dir / "test.parquet"
+
         if test_path.exists():
             print(f"Reading {test_path}...")
-            df_test  = pd.read_parquet(test_path)
+            df_test = pd.read_parquet(test_path)
             probs = inferencer.predict(df_test["code"].values, batch_size=cfg.batch_size * 2)
-            
+
             submission = pd.DataFrame({
                 "ID": df_test["ID"].values,
                 "label": (probs > 0.5).astype(int),
             })
-            
+
             sub_path = Path("/kaggle/working/submission.csv") if IN_KAGGLE else Path(model_dir) / "submission.csv"
             submission.to_csv(sub_path, index=False)
-            
+
             pd.DataFrame({
                 "ID": df_test["ID"].values,
                 "prob_ai": probs,
                 "label": (probs > 0.5).astype(int),
             }).to_parquet(Path(model_dir) / "test_preds_p5.parquet", index=False)
-            
-            print(f"\n[DONE] Lưu file submission tại: {sub_path}")
-            print(f"Predicted AI ratio: {(probs > 0.5).mean():.4f}")
+
+            print(f"\n[DONE] Submission: {sub_path}")
+            print(f"  Predicted AI ratio: {(probs > 0.5).mean():.4f}")
+            print(f"  Label distribution: {submission['label'].value_counts().to_dict()}")
+            print(f"  Prob stats: mean={probs.mean():.4f}, std={probs.std():.4f}, "
+                  f"min={probs.min():.4f}, max={probs.max():.4f}")
         else:
-            print(f"[WARN] Không tìm thấy file {test_path} để inference.")
-            
+            print(f"[WARN] Không tìm thấy {test_path}")
+
         sys.exit(0)
 
-    # ── 8.1 Load data ──
-    print("\n[1/6] Loading data...")
+    # ── 9.1 Load data ──
+    print("\n[1/5] Loading data...")
     data_dir = Path(cfg.data_dir)
     train_path = data_dir / "train.parquet"
-    val_path   = data_dir / "validation.parquet"
-    test_path  = data_dir / "test.parquet"
+    val_path = data_dir / "validation.parquet"
+    test_path = data_dir / "test.parquet"
 
-    df_train = pd.read_parquet(train_path)
-    df_val   = pd.read_parquet(val_path)
-    df_test  = pd.read_parquet(test_path) if test_path.exists() else pd.DataFrame(columns=["ID", "code", "label", "language"])
+    df_train_full = pd.read_parquet(train_path)
+    df_val = pd.read_parquet(val_path)
+    df_test = pd.read_parquet(test_path) if test_path.exists() else pd.DataFrame(columns=["ID", "code", "label", "language"])
 
-    if cfg.train_sample > 0:
-        df_train = df_train.sample(cfg.train_sample, random_state=cfg.seed).reset_index(drop=True)
-        print(f"  Subsampled train to {len(df_train):,}")
+    print(f"  Full train={len(df_train_full):,}, Val={len(df_val):,}, Test={len(df_test):,}")
+    print(f"  Train label distribution: {df_train_full['label'].value_counts().to_dict()}")
 
-    print(f"  Train={len(df_train):,}, Val={len(df_val):,}, Test={len(df_test):,}")
-
-    # ── 7.2 Extract expert features ──
-    print("\n[2/6] Extracting expert features (13-dim)...")
+    # ── 9.2 Extract expert features (trên toàn bộ data, cache) ──
+    print("\n[2/5] Extracting expert features (13-dim)...")
 
     cache_dir = Path(cfg.output_dir)
 
@@ -689,22 +894,25 @@ if __name__ == "__main__":
             return np.empty((0, 13), dtype=np.float32)
         cache = cache_dir / f"expert_feats_{name}.npy"
         if cache.exists():
-            print(f"  Loaded cached: {cache.name}")
-            return np.load(cache)
+            feats = np.load(cache)
+            if feats.shape[0] == len(df):
+                print(f"  Loaded cached: {cache.name} {feats.shape}")
+                return feats
+            else:
+                print(f"  Cache size mismatch ({feats.shape[0]} vs {len(df)}), re-extracting...")
         feats = np.stack([extract_13_features(c) for c in
                           tqdm(df[code_col], desc=f"  {name}", leave=False, mininterval=10.0)])
         np.save(cache, feats)
         print(f"  Cached: {cache.name} {feats.shape}")
         return feats
 
-    feats_train = get_or_cache_features(df_train, "train")
-    feats_val   = get_or_cache_features(df_val,   "val")
-    feats_test  = get_or_cache_features(df_test,  "test")
+    feats_train_full = get_or_cache_features(df_train_full, "train")
+    feats_val = get_or_cache_features(df_val, "val")
+    feats_test = get_or_cache_features(df_test, "test")
 
-    # ── 7.3 XGBoost probability (14th feature) ──
-    print("\n[3/6] Generating XGBoost probabilities...")
+    # ── 9.3 XGBoost probability (14th feature) ──
+    print("\n[3/5] Generating XGBoost probabilities...")
 
-    # Try to load Phase 4 models; if not available, train a quick one
     xgb_model_path = cache_dir / "xgb_for_p5.pkl"
     if xgb_model_path.exists():
         with open(xgb_model_path, "rb") as f:
@@ -719,7 +927,7 @@ if __name__ == "__main__":
             tree_method="hist", device="cuda" if device.type == "cuda" else "cpu",
             random_state=cfg.seed, verbosity=0,
         )
-        xgb_model.fit(feats_train, df_train["label"].values,
+        xgb_model.fit(feats_train_full, df_train_full["label"].values,
                       eval_set=[(feats_val, df_val["label"].values)],
                       verbose=False)
         xgb_data = {"model": xgb_model}
@@ -731,158 +939,112 @@ if __name__ == "__main__":
     if isinstance(xgb_model, dict):
         xgb_model = xgb_model.get("models", [xgb_model])[0]
 
-    xgb_prob_train = xgb_model.predict_proba(feats_train)[:, 1].reshape(-1, 1)
-    xgb_prob_val   = xgb_model.predict_proba(feats_val)[:, 1].reshape(-1, 1)
-    xgb_prob_test  = xgb_model.predict_proba(feats_test)[:, 1].reshape(-1, 1) if len(feats_test) > 0 else np.empty((0, 1))
+    # XGB probs trên toàn bộ data
+    xgb_prob_train_full = xgb_model.predict_proba(feats_train_full)[:, 1].reshape(-1, 1)
+    xgb_prob_val = xgb_model.predict_proba(feats_val)[:, 1].reshape(-1, 1)
+    xgb_prob_test = xgb_model.predict_proba(feats_test)[:, 1].reshape(-1, 1) if len(feats_test) > 0 else np.empty((0, 1))
 
-    # Concat: 13 features + 1 XGB prob = 14-dim
-    expert_train = np.hstack([feats_train, xgb_prob_train])  # (N, 14)
-    expert_val   = np.hstack([feats_val,   xgb_prob_val])
-    expert_test  = np.hstack([feats_test,  xgb_prob_test]) if len(feats_test) > 0 else np.empty((0, 14))
+    # 14-dim expert features
+    expert_train_full = np.hstack([feats_train_full, xgb_prob_train_full])
+    expert_val = np.hstack([feats_val, xgb_prob_val])
+    expert_test = np.hstack([feats_test, xgb_prob_test]) if len(feats_test) > 0 else np.empty((0, 14))
 
-    # Z-score normalization (mu=0, sigma=1)
+    # Z-score (fit trên toàn bộ train)
     scaler = StandardScaler()
-    expert_train = scaler.fit_transform(expert_train).astype(np.float32)
-    expert_val   = scaler.transform(expert_val).astype(np.float32)
-    expert_test  = scaler.transform(expert_test).astype(np.float32) if len(expert_test) > 0 else expert_test
+    expert_train_full = scaler.fit_transform(expert_train_full).astype(np.float32)
+    expert_val = scaler.transform(expert_val).astype(np.float32)
+    expert_test = scaler.transform(expert_test).astype(np.float32) if len(expert_test) > 0 else expert_test
 
     with open(cache_dir / "zscore_scaler.pkl", "wb") as f:
         pickle.dump(scaler, f)
-    print(f"  Expert features: train={expert_train.shape}, val={expert_val.shape}")
+    print(f"  Expert features: train={expert_train_full.shape}, val={expert_val.shape}")
 
-    # ── 7.4 Tokenizer ──
-    print(f"\n[4/6] Loading tokenizer: {cfg.backbone_name}")
+    # Lưu index mapping cho balanced subsets
+    # (vì expert features đã tính trên full train, ta cần map index)
+    df_train_full = df_train_full.reset_index(drop=True)
+
+    # ── 9.4 Tokenizer ──
+    print(f"\n[4/5] Loading tokenizer: {cfg.backbone_name}")
     tokenizer = AutoTokenizer.from_pretrained(cfg.backbone_name)
     print(f"  Vocab size: {tokenizer.vocab_size}")
 
-    # ── 7.5 K-Fold Training ──
-    print(f"\n[5/6] Training {cfg.n_folds}-Fold CV...")
+    # ── 9.5 Balanced Ensemble Training ──
+    print(f"\n[5/5] Training Balanced Ensemble ({cfg.n_ensemble} models)...")
+    print(f"  Mỗi model: {cfg.train_sample:,} samples (balanced 50/50)")
+    print(f"  Epochs per model: {cfg.epochs}")
+    print(f"  Progressive unfreezing: freeze {cfg.freeze_backbone_epochs} epochs đầu")
 
-    codes_train = df_train["code"].values
-    labels_train = df_train["label"].values
     codes_val = df_val["code"].values
     labels_val = df_val["label"].values
 
-    skf = StratifiedKFold(cfg.n_folds, shuffle=True, random_state=cfg.seed)
-    fold_aucs = []; fold_f1s = []
-    oof_probs = np.zeros(len(codes_train))
-    fold_models_dir = cache_dir / "fold_models"
-    fold_models_dir.mkdir(exist_ok=True)
+    ensemble_dir = cache_dir / "ensemble_models"
+    ensemble_dir.mkdir(exist_ok=True)
 
-    criterion = HybridLoss(alpha=cfg.supcon_alpha,
-                           temperature=cfg.supcon_temperature)
+    model_aucs = []
 
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(codes_train, labels_train), 1):
-        print(f"\n{'='*60}")
-        print(f"  FOLD {fold}/{cfg.n_folds}")
-        print(f"{'='*60}")
-        print(f"  Train: {len(tr_idx):,}, Val: {len(va_idx):,}")
+    for model_idx in range(1, cfg.n_ensemble + 1):
+        model_seed = cfg.seed + model_idx * 100
 
-        # Checkpoint resume
-        fold_model_path = fold_models_dir / f"fold{fold}_best.pt"
-        if fold_model_path.exists():
-            print(f"  [Resume] Tìm thấy model của fold {fold}. Bỏ qua train và tiến hành load...")
-            model = HybridFusionModel(
-                cfg.backbone_name, cfg.expert_input_dim,
-                cfg.expert_hidden_dim, cfg.projection_dim, cfg.dropout,
-            ).to(device)
-            model.load_state_dict(torch.load(fold_model_path, weights_only=True))
+        # Tạo balanced subset cho model này
+        df_subset, original_indices = create_balanced_subset(df_train_full, cfg.train_sample, model_seed)
 
-            ds_va = HybridCodeDataset(
-                codes_train[va_idx], expert_train[va_idx], labels_train[va_idx],
-                tokenizer, cfg.max_length)
-            dl_va = DataLoader(ds_va, batch_size=cfg.batch_size * 2, shuffle=False,
-                               num_workers=2, pin_memory=True)
-                               
-            val_probs, val_auc, val_f1 = evaluate(model, dl_va, device, cfg)
-            oof_probs[va_idx] = val_probs
-            fold_aucs.append(val_auc)
-            fold_f1s.append(val_f1)
-            print(f"  Fold {fold} resumed: AUC={val_auc:.4f}, F1={val_f1:.4f}")
-            del model, ds_va, dl_va
-            gc.collect(); torch.cuda.empty_cache()
+        # Lấy expert features tương ứng (dùng original index từ df_train_full)
+        expert_subset = expert_train_full[original_indices]
+
+        # Train
+        auc = train_single_model(
+            model_idx, df_subset, expert_subset,
+            codes_val, expert_val, labels_val,
+            tokenizer, device, cfg, ensemble_dir
+        )
+        model_aucs.append(auc)
+
+    # -- Ensemble Summary --
+    print(f"\n{'='*60}")
+    print(f"  BALANCED ENSEMBLE SUMMARY ({cfg.n_ensemble} models)")
+    print(f"  Individual AUCs: {[f'{a:.4f}' for a in model_aucs]}")
+    print(f"  Mean AUC: {np.mean(model_aucs):.4f}")
+    print(f"{'='*60}")
+
+    # -- Ensemble validation --
+    print("\n  Ensemble validation...")
+    val_ds = HybridCodeDataset(codes_val, expert_val, labels_val, tokenizer, cfg.max_length)
+    val_dl = DataLoader(val_ds, batch_size=cfg.batch_size * 2, shuffle=False,
+                        num_workers=2, pin_memory=True)
+
+    val_probs_ens = np.zeros(len(codes_val))
+    n_loaded = 0
+    for model_idx in range(1, cfg.n_ensemble + 1):
+        model_pt = ensemble_dir / f"model{model_idx}_best.pt"
+        if not model_pt.exists():
             continue
-
-        # Datasets
-        ds_tr = HybridCodeDataset(
-            codes_train[tr_idx], expert_train[tr_idx], labels_train[tr_idx],
-            tokenizer, cfg.max_length)
-        ds_va = HybridCodeDataset(
-            codes_train[va_idx], expert_train[va_idx], labels_train[va_idx],
-            tokenizer, cfg.max_length)
-
-        dl_tr = DataLoader(ds_tr, batch_size=cfg.batch_size, shuffle=True,
-                           num_workers=2, pin_memory=True, drop_last=True)
-        dl_va = DataLoader(ds_va, batch_size=cfg.batch_size * 2, shuffle=False,
-                           num_workers=2, pin_memory=True)
-
-        # Model
         model = HybridFusionModel(
             cfg.backbone_name, cfg.expert_input_dim,
             cfg.expert_hidden_dim, cfg.projection_dim, cfg.dropout,
         ).to(device)
+        model.load_state_dict(torch.load(model_pt, weights_only=True))
+        probs, _, _ = evaluate(model, val_dl, device, cfg)
+        val_probs_ens += probs
+        n_loaded += 1
+        del model; gc.collect(); torch.cuda.empty_cache()
 
-        # Enable gradient checkpointing (saves VRAM)
-        if hasattr(model.backbone, "gradient_checkpointing_enable"):
-            model.backbone.gradient_checkpointing_enable()
+    val_probs_ens /= max(n_loaded, 1)
+    val_auc_ens = roc_auc_score(labels_val, val_probs_ens)
+    val_f1_ens = f1_score(labels_val, (val_probs_ens > 0.5).astype(int))
+    print(f"  Ensemble Val AUC: {val_auc_ens:.4f}")
+    print(f"  Ensemble Val F1:  {val_f1_ens:.4f}")
+    print(f"  Ensemble Predicted AI ratio: {(val_probs_ens > 0.5).mean():.4f}")
 
-        optimizer = get_optimizer(model, cfg)
-        total_steps = (len(dl_tr) // cfg.grad_accum_steps) * cfg.epochs
-        scheduler = get_scheduler(optimizer, total_steps, cfg.warmup_ratio)
-        scaler = torch.cuda.amp.GradScaler(enabled=cfg.fp16)
+    # Classification report
+    print("\n  Ensemble Classification Report (validation):")
+    print(classification_report(labels_val, (val_probs_ens > 0.5).astype(int),
+                                target_names=["Human (0)", "AI (1)"]))
 
-        best_auc = 0; patience = 0
-        for epoch in range(1, cfg.epochs + 1):
-            t0 = time.time()
-            train_loss = train_one_epoch(
-                model, dl_tr, criterion, optimizer, scheduler, scaler,
-                device, cfg, epoch)
+    del val_ds, val_dl
+    gc.collect(); torch.cuda.empty_cache()
 
-            val_probs, val_auc, val_f1 = evaluate(model, dl_va, device, cfg)
-            elapsed = time.time() - t0
-
-            print(f"  Epoch {epoch}: loss={train_loss:.4f}, "
-                  f"val_AUC={val_auc:.4f}, val_F1={val_f1:.4f}, "
-                  f"time={elapsed:.0f}s")
-
-            if val_auc > best_auc:
-                best_auc = val_auc
-                patience = 0
-                torch.save(model.state_dict(),
-                           fold_models_dir / f"fold{fold}_best.pt")
-            else:
-                patience += 1
-                if patience >= 2:
-                    print(f"  Early stop at epoch {epoch}")
-                    break
-
-        # Reload best and get OOF predictions
-        model.load_state_dict(torch.load(fold_models_dir / f"fold{fold}_best.pt",
-                                         weights_only=True))
-        val_probs, val_auc, val_f1 = evaluate(model, dl_va, device, cfg)
-        oof_probs[va_idx] = val_probs
-        fold_aucs.append(val_auc)
-        fold_f1s.append(val_f1)
-        print(f"  Fold {fold} best: AUC={val_auc:.4f}, F1={val_f1:.4f}")
-
-        # Cleanup
-        del model, optimizer, scheduler, scaler, ds_tr, ds_va, dl_tr, dl_va
-        gc.collect(); torch.cuda.empty_cache()
-
-    # -- CV Summary --
-    print(f"\n{'='*60}")
-    print(f"  {cfg.n_folds}-Fold CV Summary:")
-    print(f"    AUC: {np.mean(fold_aucs):.4f} +/- {np.std(fold_aucs):.4f}")
-    print(f"    F1:  {np.mean(fold_f1s):.4f} +/- {np.std(fold_f1s):.4f}")
-    print(f"{'='*60}")
-
-    oof_labels = (oof_probs > 0.5).astype(int)
-    print("\n  OOF Classification Report:")
-    print(classification_report(labels_train, oof_labels,
-                                target_names=["Human", "AI"]))
-
-    # ── 7.6 Inference on test set ──
-    print("\n[6/6] Test inference (ensemble of best folds)...")
+    # ── 9.6 Inference on test set ──
+    print("\n[6/6] Test inference (ensemble)...")
 
     if len(df_test) > 0:
         test_ds = HybridCodeDataset(
@@ -891,17 +1053,22 @@ if __name__ == "__main__":
                              num_workers=2, pin_memory=True)
 
         test_probs = np.zeros(len(df_test))
-        for fold in range(1, cfg.n_folds + 1):
+        n_loaded = 0
+        for model_idx in range(1, cfg.n_ensemble + 1):
+            model_pt = ensemble_dir / f"model{model_idx}_best.pt"
+            if not model_pt.exists():
+                continue
             model = HybridFusionModel(
                 cfg.backbone_name, cfg.expert_input_dim,
                 cfg.expert_hidden_dim, cfg.projection_dim, cfg.dropout,
             ).to(device)
-            model.load_state_dict(torch.load(
-                fold_models_dir / f"fold{fold}_best.pt", weights_only=True))
-
+            model.load_state_dict(torch.load(model_pt, weights_only=True))
             probs, _, _ = evaluate(model, test_dl, device, cfg)
-            test_probs += probs / cfg.n_folds
+            test_probs += probs
+            n_loaded += 1
             del model; gc.collect(); torch.cuda.empty_cache()
+
+        test_probs /= max(n_loaded, 1)
 
         # Submission
         submission = pd.DataFrame({
@@ -923,73 +1090,14 @@ if __name__ == "__main__":
 
         print(f"\n  Submission: {sub_path}")
         print(f"  Predicted AI ratio: {(test_probs > 0.5).mean():.4f}")
-        print(f"  Label dist: {submission['label'].value_counts().to_dict()}")
+        print(f"  Label distribution: {submission['label'].value_counts().to_dict()}")
+        print(f"  Prob stats: mean={test_probs.mean():.4f}, std={test_probs.std():.4f}")
     else:
-        print("  Bỏ qua Inference trên test.parquet do không tìm thấy file.")
-
-    # -- Validate on val set --
-    print("\n  Validation set (ensemble)...")
-    val_ds = HybridCodeDataset(
-        codes_val, expert_val, labels_val, tokenizer, cfg.max_length)
-    val_dl = DataLoader(val_ds, batch_size=cfg.batch_size * 2, shuffle=False,
-                        num_workers=2, pin_memory=True)
-
-    val_probs_ens = np.zeros(len(codes_val))
-    for fold in range(1, cfg.n_folds + 1):
-        model = HybridFusionModel(
-            cfg.backbone_name, cfg.expert_input_dim,
-            cfg.expert_hidden_dim, cfg.projection_dim, cfg.dropout,
-        ).to(device)
-        model.load_state_dict(torch.load(
-            fold_models_dir / f"fold{fold}_best.pt", weights_only=True))
-        probs, _, _ = evaluate(model, val_dl, device, cfg)
-        val_probs_ens += probs / cfg.n_folds
-        del model; gc.collect(); torch.cuda.empty_cache()
-
-    val_auc_ens = roc_auc_score(labels_val, val_probs_ens)
-    val_f1_ens = f1_score(labels_val, (val_probs_ens > 0.5).astype(int))
-    print(f"  Val AUC (ensemble): {val_auc_ens:.4f}")
-    print(f"  Val F1  (ensemble): {val_f1_ens:.4f}")
+        print("  Bỏ qua test inference (không tìm thấy test.parquet)")
 
     print(f"\n{'='*60}")
-    print(f"  PHASE 5 COMPLETE")
-    print(f"  CV AUC:  {np.mean(fold_aucs):.4f}")
-    print(f"  Val AUC: {val_auc_ens:.4f}")
-    print(f"  Output:  {sub_path}")
+    print(f"  PHASE 5 v2 COMPLETE")
+    print(f"  Ensemble Val AUC: {val_auc_ens:.4f}")
+    print(f"  Ensemble Val F1:  {val_f1_ens:.4f}")
+    print(f"  Models saved: {ensemble_dir}")
     print(f"{'='*60}")
-
-    # ── 7.7 TẠO FILE QUÉT NỘP THỬ THEO FORMAT test_sample.parquet ──
-    print("\n[7/7] Tạo output dựa trên format của test_sample.parquet...")
-    sample_path = data_dir / "test_sample.parquet"
-    if sample_path.exists():
-        df_sample = pd.read_parquet(sample_path)
-        feats_sample = np.stack([extract_13_features(c) for c in df_sample["code"]])
-        xgb_prob_sample = xgb_model.predict_proba(feats_sample)[:, 1].reshape(-1, 1)
-        expert_sample = np.hstack([feats_sample, xgb_prob_sample])
-        expert_sample = scaler.transform(expert_sample).astype(np.float32)
-
-        sample_ds = HybridCodeDataset(
-            df_sample["code"].values, expert_sample, None, tokenizer, cfg.max_length)
-        sample_dl = DataLoader(sample_ds, batch_size=cfg.batch_size * 2, shuffle=False,
-                               num_workers=2, pin_memory=True)
-
-        sample_probs = np.zeros(len(df_sample))
-        for fold in range(1, cfg.n_folds + 1):
-            model = HybridFusionModel(
-                cfg.backbone_name, cfg.expert_input_dim,
-                cfg.expert_hidden_dim, cfg.projection_dim, cfg.dropout,
-            ).to(device)
-            model.load_state_dict(torch.load(
-                fold_models_dir / f"fold{fold}_best.pt", weights_only=True))
-            probs, _, _ = evaluate(model, sample_dl, device, cfg)
-            sample_probs += probs / cfg.n_folds
-            del model; gc.collect(); torch.cuda.empty_cache()
-
-        df_sample["label"] = (sample_probs > 0.5).astype(int)
-        df_sample = df_sample[['code', 'generator', 'label', 'language']]
-        
-        out_sample_path = cache_dir / "test_sample_predictions.parquet"
-        df_sample.to_parquet(out_sample_path, index=False)
-        print(f"  Đã lưu output quét thử thành công tại: {out_sample_path}")
-    else:
-        print(f"  Không tìm thấy file {sample_path}.")

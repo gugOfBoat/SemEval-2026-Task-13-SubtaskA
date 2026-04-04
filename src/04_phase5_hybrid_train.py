@@ -56,7 +56,7 @@ class Config:
     # -- Paths --
     data_dir: str = ""                         # Set below
     output_dir: str = ""                       # Set below
-    backbone_name: str = "microsoft/codebert-base"  # or "microsoft/deberta-v3-base"
+    backbone_name: str = "microsoft/unixcoder-base"  # UniXcoder: unified cross-modal code repr
 
     # -- Data --
     max_length: int = 512                      # Token limit (covers ~95% samples)

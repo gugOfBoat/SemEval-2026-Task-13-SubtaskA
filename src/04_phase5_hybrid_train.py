@@ -155,6 +155,63 @@ _LANG = {
 }
 _BRANCH_KW = re.compile(r"\b(if|elif|else|for|while|try|except|catch|case|switch)\b")
 
+# -- Tree-sitter parsers (real AST) --
+try:
+    from tree_sitter import Language, Parser as TSParser
+    import tree_sitter_python as _tspy
+    import tree_sitter_java as _tsja
+    import tree_sitter_cpp as _tscpp
+    _TS_LANGS = {
+        "Python": Language(_tspy.language()),
+        "Java":   Language(_tsja.language()),
+        "C++":    Language(_tscpp.language()),
+    }
+    _TS_AVAILABLE = True
+    print("[AST] Tree-sitter loaded (Python, Java, C++)")
+except (ImportError, Exception):
+    _TS_AVAILABLE = False
+    print("[AST] Tree-sitter NOT available — using indentation fallback")
+
+_AST_BRANCH_TYPES = frozenset({
+    "if_statement", "elif_clause", "else_clause",
+    "for_statement", "while_statement", "for_in_clause",
+    "try_statement", "except_clause", "catch_clause",
+    "switch_statement", "switch_expression", "case_statement",
+    "conditional_expression", "ternary_expression", "do_statement",
+})
+
+
+def _compute_ast_metrics(code: str, lang: str) -> Tuple[float, float]:
+    """Compute avg_ast_depth and branch_ratio using real tree-sitter AST.
+    Returns (avg_ast_depth, branch_ratio) or (None, None) on failure.
+    """
+    if not _TS_AVAILABLE:
+        return None, None
+    try:
+        ts_lang = _TS_LANGS.get(lang, _TS_LANGS["Python"])
+        parser = TSParser(ts_lang)
+        tree = parser.parse(code.encode("utf-8", errors="replace"))
+        root = tree.root_node
+        if root.child_count == 0:
+            return 0.0, 0.0
+        depths = []
+        branch_count = 0
+        total_nodes = 0
+        stack = [(root, 0)]
+        while stack:
+            node, depth = stack.pop()
+            total_nodes += 1
+            depths.append(depth)
+            if node.type in _AST_BRANCH_TYPES:
+                branch_count += 1
+            for child in node.children:
+                stack.append((child, depth + 1))
+        avg_d = float(np.mean(depths)) if depths else 0.0
+        branch_r = branch_count / max(total_nodes, 1)
+        return avg_d, branch_r
+    except Exception:
+        return None, None
+
 
 def detect_language(code: str) -> str:
     scores = {l: len(p.findall(code)) for l, p in _LANG.items()}
@@ -209,12 +266,17 @@ def extract_13_features(code: str) -> np.ndarray:
     else:
         avg_id = 0.0; long_r = 0.0
 
-    # avg_ast_depth (regex fallback — fast)
-    depths = []
-    for l in ne:
-        s = l.lstrip()
-        depths.append((len(l) - len(s)) / 4.0)
-    avg_ast = float(np.mean(depths)) if depths else 0.0
+    # avg_ast_depth & branch_ratio — real tree-sitter AST with fallback
+    lang = detect_language(code)
+    ast_depth, ast_branch_r = _compute_ast_metrics(code, lang)
+    if ast_depth is not None:
+        avg_ast = ast_depth
+    else:
+        depths = []
+        for l in ne:
+            s = l.lstrip()
+            depths.append((len(l) - len(s)) / 4.0)
+        avg_ast = float(np.mean(depths)) if depths else 0.0
 
     # token_entropy
     toks = re.findall(r"\b\w+\b", code)
@@ -224,9 +286,11 @@ def extract_13_features(code: str) -> np.ndarray:
     else:
         tok_ent = 0.0
 
-    # branch_ratio
-    branches = len(_BRANCH_KW.findall(code))
-    branch_r = branches / n_ne
+    if ast_branch_r is not None:
+        branch_r = ast_branch_r
+    else:
+        branches = len(_BRANCH_KW.findall(code))
+        branch_r = branches / n_ne
 
     # zlib_compression_ratio
     if code:
@@ -710,9 +774,11 @@ class HybridInferencer:
         self.n_ensemble = n_ensemble
 
         # 1. Load XGBoost model
-        xgb_path = self.model_dir / "xgb_for_p5.pkl"
+        xgb_path = self.model_dir / "xgb_for_p5_v2.pkl"
         if not xgb_path.exists():
-            raise FileNotFoundError(f"Không tìm thấy XGBoost model tại {xgb_path}")
+            xgb_path = self.model_dir / "xgb_for_p5.pkl"  # fallback v1
+        if not xgb_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy XGBoost model tại {self.model_dir}")
         with open(xgb_path, "rb") as f:
             xgb_m = pickle.load(f)
             self.xgb_model = xgb_m.get("model", xgb_m) if isinstance(xgb_m, dict) else xgb_m
@@ -760,6 +826,15 @@ class HybridInferencer:
         if not self.models:
             raise FileNotFoundError("Không tìm thấy bất kỳ model nào!")
         print(f"Inference engine ready ({len(self.models)} models).")
+
+        # 5. Load optimal threshold
+        thresh_path = self.model_dir / "optimal_threshold.txt"
+        if thresh_path.exists():
+            self.threshold = float(thresh_path.read_text().strip())
+            print(f"  Optimal threshold loaded: {self.threshold:.4f}")
+        else:
+            self.threshold = 0.5
+            print(f"  Using default threshold: {self.threshold}")
 
     @torch.no_grad()
     def predict(self, codes: list, batch_size=32):
@@ -846,9 +921,10 @@ if __name__ == "__main__":
             df_test = pd.read_parquet(test_path)
             probs = inferencer.predict(df_test["code"].values, batch_size=cfg.batch_size * 2)
 
+            _thresh = inferencer.threshold
             submission = pd.DataFrame({
                 "ID": df_test["ID"].values,
-                "label": (probs > 0.5).astype(int),
+                "label": (probs > _thresh).astype(int),
             })
 
             sub_path = Path("/kaggle/working/submission.csv") if IN_KAGGLE else Path(model_dir) / "submission.csv"
@@ -857,11 +933,12 @@ if __name__ == "__main__":
             pd.DataFrame({
                 "ID": df_test["ID"].values,
                 "prob_ai": probs,
-                "label": (probs > 0.5).astype(int),
+                "label": (probs > _thresh).astype(int),
             }).to_parquet(Path(model_dir) / "test_preds_p5.parquet", index=False)
 
             print(f"\n[DONE] Submission: {sub_path}")
-            print(f"  Predicted AI ratio: {(probs > 0.5).mean():.4f}")
+            print(f"  Threshold: {_thresh:.4f}")
+            print(f"  Predicted AI ratio: {(probs > _thresh).mean():.4f}")
             print(f"  Label distribution: {submission['label'].value_counts().to_dict()}")
             print(f"  Prob stats: mean={probs.mean():.4f}, std={probs.std():.4f}, "
                   f"min={probs.min():.4f}, max={probs.max():.4f}")
@@ -892,7 +969,7 @@ if __name__ == "__main__":
     def get_or_cache_features(df, name, code_col="code"):
         if len(df) == 0:
             return np.empty((0, 13), dtype=np.float32)
-        cache = cache_dir / f"expert_feats_{name}.npy"
+        cache = cache_dir / f"expert_feats_{name}_v2ast.npy"
         if cache.exists():
             feats = np.load(cache)
             if feats.shape[0] == len(df):
@@ -910,24 +987,54 @@ if __name__ == "__main__":
     feats_val = get_or_cache_features(df_val, "val")
     feats_test = get_or_cache_features(df_test, "test")
 
-    # ── 9.3 XGBoost probability (14th feature) ──
-    print("\n[3/5] Generating XGBoost probabilities...")
+    # ── 9.3 XGBoost probability (14th feature) — OOF to prevent leakage ──
+    print("\n[3/5] Generating XGBoost probabilities (OOF for train)...")
 
-    xgb_model_path = cache_dir / "xgb_for_p5.pkl"
-    if xgb_model_path.exists():
+    xgb_model_path = cache_dir / "xgb_for_p5_v2.pkl"
+    xgb_oof_path = cache_dir / "xgb_oof_probs_v2.npy"
+
+    from sklearn.model_selection import StratifiedKFold
+
+    if xgb_model_path.exists() and xgb_oof_path.exists():
         with open(xgb_model_path, "rb") as f:
             xgb_data = pickle.load(f)
-        print("  Loaded cached XGB model")
+        xgb_prob_train_full = np.load(xgb_oof_path).reshape(-1, 1)
+        print(f"  Loaded cached XGB model + OOF probs {xgb_prob_train_full.shape}")
     else:
         import xgboost as xgb_lib
-        print("  Training quick XGBoost (for probability feature)...")
+        print("  Training XGBoost with 5-fold OOF (prevents data leakage)...")
+        train_labels = df_train_full["label"].values
+        xgb_oof = np.zeros(len(feats_train_full))
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=cfg.seed)
+
+        for fold, (tr_idx, va_idx) in enumerate(skf.split(feats_train_full, train_labels), 1):
+            xgb_fold = xgb_lib.XGBClassifier(
+                n_estimators=300, max_depth=6, learning_rate=0.1,
+                subsample=0.8, colsample_bytree=0.8,
+                tree_method="hist", device="cuda" if device.type == "cuda" else "cpu",
+                random_state=cfg.seed, verbosity=0,
+            )
+            xgb_fold.fit(feats_train_full[tr_idx], train_labels[tr_idx],
+                         eval_set=[(feats_train_full[va_idx], train_labels[va_idx])],
+                         verbose=False)
+            xgb_oof[va_idx] = xgb_fold.predict_proba(feats_train_full[va_idx])[:, 1]
+            fold_auc = roc_auc_score(train_labels[va_idx], xgb_oof[va_idx])
+            print(f"    Fold {fold}: OOF AUC = {fold_auc:.4f}")
+            del xgb_fold; gc.collect()
+
+        xgb_prob_train_full = xgb_oof.reshape(-1, 1)
+        np.save(xgb_oof_path, xgb_oof)
+        print(f"  OOF AUC (full): {roc_auc_score(train_labels, xgb_oof):.4f}")
+
+        # Final XGB on all train data (for val/test inference)
+        print("  Training final XGBoost on all training data...")
         xgb_model = xgb_lib.XGBClassifier(
             n_estimators=300, max_depth=6, learning_rate=0.1,
             subsample=0.8, colsample_bytree=0.8,
             tree_method="hist", device="cuda" if device.type == "cuda" else "cpu",
             random_state=cfg.seed, verbosity=0,
         )
-        xgb_model.fit(feats_train_full, df_train_full["label"].values,
+        xgb_model.fit(feats_train_full, train_labels,
                       eval_set=[(feats_val, df_val["label"].values)],
                       verbose=False)
         xgb_data = {"model": xgb_model}
@@ -939,10 +1046,11 @@ if __name__ == "__main__":
     if isinstance(xgb_model, dict):
         xgb_model = xgb_model.get("models", [xgb_model])[0]
 
-    # XGB probs trên toàn bộ data
-    xgb_prob_train_full = xgb_model.predict_proba(feats_train_full)[:, 1].reshape(-1, 1)
+    # Val/Test: use final model (only train uses OOF)
     xgb_prob_val = xgb_model.predict_proba(feats_val)[:, 1].reshape(-1, 1)
     xgb_prob_test = xgb_model.predict_proba(feats_test)[:, 1].reshape(-1, 1) if len(feats_test) > 0 else np.empty((0, 1))
+    print(f"  OOF train probs: mean={xgb_prob_train_full.mean():.4f}, std={xgb_prob_train_full.std():.4f}")
+    print(f"  Val probs:       mean={xgb_prob_val.mean():.4f}, std={xgb_prob_val.std():.4f}")
 
     # 14-dim expert features
     expert_train_full = np.hstack([feats_train_full, xgb_prob_train_full])
@@ -1040,6 +1148,26 @@ if __name__ == "__main__":
     print(classification_report(labels_val, (val_probs_ens > 0.5).astype(int),
                                 target_names=["Human (0)", "AI (1)"]))
 
+    # -- Optimal threshold search (Macro F1) --
+    print("  Searching optimal threshold on validation set...")
+    best_t, best_mf1 = 0.5, 0.0
+    for t in np.arange(0.25, 0.75, 0.005):
+        preds_t = (val_probs_ens > t).astype(int)
+        mf1 = f1_score(labels_val, preds_t, average="macro")
+        if mf1 > best_mf1:
+            best_t, best_mf1 = t, mf1
+    optimal_threshold = best_t
+    opt_preds = (val_probs_ens > optimal_threshold).astype(int)
+    print(f"  Optimal threshold: {optimal_threshold:.3f} (Macro F1={best_mf1:.4f})")
+    print(f"  Val pred ratio (optimal): AI={opt_preds.mean():.4f} "
+          f"(actual={labels_val.mean():.4f})")
+    print(f"  Val label dist (optimal): "
+          f"{{0: {(opt_preds==0).sum()}, 1: {(opt_preds==1).sum()}}}")
+
+    # Save threshold for inference-only mode
+    with open(cache_dir / "optimal_threshold.txt", "w") as f:
+        f.write(f"{optimal_threshold:.6f}\n")
+
     del val_ds, val_dl
     gc.collect(); torch.cuda.empty_cache()
 
@@ -1073,7 +1201,7 @@ if __name__ == "__main__":
         # Submission
         submission = pd.DataFrame({
             "ID": df_test["ID"].values,
-            "label": (test_probs > 0.5).astype(int),
+            "label": (test_probs > optimal_threshold).astype(int),
         })
         if IN_KAGGLE:
             sub_path = Path("/kaggle/working/submission.csv")
@@ -1085,11 +1213,12 @@ if __name__ == "__main__":
         pd.DataFrame({
             "ID": df_test["ID"].values,
             "prob_ai": test_probs,
-            "label": (test_probs > 0.5).astype(int),
+            "label": (test_probs > optimal_threshold).astype(int),
         }).to_parquet(cache_dir / "test_preds_p5.parquet", index=False)
 
         print(f"\n  Submission: {sub_path}")
-        print(f"  Predicted AI ratio: {(test_probs > 0.5).mean():.4f}")
+        print(f"  Threshold: {optimal_threshold:.3f}")
+        print(f"  Predicted AI ratio: {(test_probs > optimal_threshold).mean():.4f}")
         print(f"  Label distribution: {submission['label'].value_counts().to_dict()}")
         print(f"  Prob stats: mean={test_probs.mean():.4f}, std={test_probs.std():.4f}")
     else:

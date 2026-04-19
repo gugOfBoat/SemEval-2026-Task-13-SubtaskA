@@ -60,7 +60,7 @@ class Config:
 
     # -- Data --
     max_length: int = 384                      # ↓ Giảm từ 512 → 384 tiết kiệm thời gian (vẫn cover ~90%)
-    train_sample: int = 30_000                 # ↓ Giảm từ 50K → 30K cho vừa 12h Kaggle
+    train_sample: int = 500_000                # Dùng toàn bộ data (capped bởi minority class ~238K/class)
 
     # -- Ensemble --
     n_ensemble: int = 2                        # ↓ Giảm từ 3 → 2 models (tiết kiệm ~33% thời gian)

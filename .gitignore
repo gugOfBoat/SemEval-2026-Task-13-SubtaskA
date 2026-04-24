@@ -14,30 +14,20 @@ venv/
 
 # ── Data (large files) ──
 data/raw/
-data/processed/*.parquet
-data/processed/*.pkl
-!data/processed/feature_list.txt
+data/processed/
 
-# ── Outputs ──
-models/
-results/
+# ── Model artifacts ──
+*.pkl
 *.pt
 *.bin
 *.ckpt
-*.pkl
+models/
+
+# ── Outputs ──
+submission.csv
 output_log*
-
-# ── Notebooks ──
-.ipynb_checkpoints/
-notebooks/*.html
-
-# ── Project Guides ──
-kaggle_workflow.md
-
-# ── Logs ──
 *.log
 logs/
-wandb/
 
 # ── Editors / OS ──
 .vscode/

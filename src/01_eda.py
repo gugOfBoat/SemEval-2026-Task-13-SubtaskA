@@ -2,14 +2,16 @@
 """
 SemEval-2026 Task 13A — EDA
 ============================
-Chạy trên Kaggle notebook:
+Chạy trên Kaggle notebook (dùng %run để plots hiện inline):
 
-    !pip install scipy -q
-    %cd /kaggle/working
-    !git clone https://github.com/gugOfBoat/SemEval-2026-Task-13-SubtaskA.git
-    !python SemEval-2026-Task-13-SubtaskA/src/01_eda.py
+    Cell 1:
+        !pip install scipy -q
+        %cd /kaggle/working
+        !git clone https://github.com/gugOfBoat/SemEval-2026-Task-13-SubtaskA.git
 
-Plots hiển thị inline trên cell output Kaggle.
+    Cell 2:
+        %matplotlib inline
+        %run SemEval-2026-Task-13-SubtaskA/src/01_eda.py
 """
 
 # ── Imports ──────────────────────────────────────────────────────────────────
@@ -17,18 +19,11 @@ import os, warnings
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
 import seaborn as sns
 warnings.filterwarnings("ignore")
-
-# Inline display on Kaggle
-try:
-    from IPython.display import display as ipy_display, Image as IpyImage
-    HAS_IPY = True
-except ImportError:
-    HAS_IPY = False
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR = Path("/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A")
@@ -40,7 +35,7 @@ plt.rcParams.update({
     "font.size": 11,
     "axes.spines.top": False,
     "axes.spines.right": False,
-    "figure.dpi": 120,
+    "figure.dpi": 110,
 })
 
 C_BLUE   = "#4C9BE8"
@@ -52,14 +47,10 @@ LANG_PALETTE  = [C_BLUE, C_RED, C_GREEN, C_YELLOW,
                  "#9B5DE5", "#F15BB5", "#00BBF9", "#FF9F1C"]
 
 
-def show(path: str):
-    """Save figure and display inline on Kaggle."""
-    fpath = OUT_DIR / path
-    plt.savefig(fpath, bbox_inches="tight")
-    plt.close()
-    if HAS_IPY:
-        ipy_display(IpyImage(str(fpath)))
-    print(f"  ✓ {path}")
+def show(title: str = ""):
+    """Tight layout + plt.show() — displays inline when run with %run."""
+    plt.tight_layout()
+    plt.show()
 
 
 def divider(title: str):
@@ -167,7 +158,7 @@ for ax, (name, df) in zip(axes, splits_labeled.items()):
     total = vc.sum()
     ax.set_title(f"{name}\n(n={total:,})", fontsize=11, fontweight="bold")
 
-show("03_label_distribution.png")
+show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,7 +205,7 @@ for i, lang in enumerate(all_langs):
                     ha="center", va="bottom", fontsize=7.5,
                     color=C_RED, fontweight="bold")
 
-show("04_language_distribution_ood.png")
+show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,7 +262,7 @@ ax.set_title("AI Rate per Language × Split\n"
              "Test sample: only 22% AI — very different from training distribution",
              fontweight="bold")
 ax.legend()
-show("05_ai_rate_per_language.png")
+show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,7 +284,7 @@ for ax, (name, df) in zip(axes, [("Train+Val", tv_df), ("Test Sample", ts_df)]):
     ax.set_title(name)
     ax.legend()
 
-show("06_code_length_dist.png")
+show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -317,11 +308,9 @@ ax.set_title("Top 12 Generators in Train+Val\n"
              "Blue = human, Red = AI models", fontweight="bold")
 ax.invert_yaxis()
 
-# Legend
-import matplotlib.patches as mpatches
 ax.legend(handles=[mpatches.Patch(color=C_BLUE, label="Human"),
                    mpatches.Patch(color=C_RED,  label="AI model")])
-show("07_generator_breakdown.png")
+show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,8 +345,9 @@ for split_name, color, hatch in [("Train+Val", C_BLUE, ""), ("Test Sample", C_RE
 
 ax_a.set_xlabel("Number of samples")
 ax_a.set_title("Sample counts (solid=Human, hatched=AI)")
-ax_a.legend([mpatches.Patch(color=C_BLUE, label="Train+Val"),
-             mpatches.Patch(color=C_RED, label="Test Sample")], loc="lower right")
+ax_a.legend(handles=[mpatches.Patch(color=C_BLUE, label="Train+Val"),
+                      mpatches.Patch(color=C_RED, label="Test Sample")],
+            loc="lower right")
 
 # ── Panel B: Language proportion donut ───────────────────────────────────────
 ax_b = fig.add_subplot(gs[0, 2])
@@ -393,7 +383,7 @@ ax_c.set_title("AI Rate per Language (Train+Val vs Test Sample)\n"
                "Bars without blue = UNSEEN language in training ⚠")
 ax_c.legend()
 
-show("08_ood_summary_dashboard.png")
+show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,5 +414,4 @@ print(f"""
   semicolons, tab vs space) will fail on unseen languages.
   Need: features that are STABLE across all 8 languages.
 
-  Plots saved to: /kaggle/working/eda_plots/
 """)

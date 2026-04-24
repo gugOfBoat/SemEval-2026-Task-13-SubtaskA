@@ -1,64 +1,84 @@
-# SemEval-2026 Task 13: GenAI Code Detection & Attribution
+# SemEval-2026 Task 13 — Subtask A: AI-Generated Code Detection
 
-> **Shared Task on Multilingual AI-Generated Code Detection** | SemEval 2026 · Task 13 (Subtasks A, B, C)
-> 
-> Distinguishing between human-written and LLM-generated code across multiple programming languages and attributing specific generator models.
+## Strategy
 
-## Repository Structure
+**Approach:** Gradient Boosting ensemble (LightGBM + XGBoost + CatBoost) on handcrafted language-agnostic features.
 
-We implement an organized Data Engineering pipeline to ingest, store, and process the dataset. 
+**Key insight:** Train set has 3 languages, test set has 8. Deep learning models overfit to language patterns. GBDT on structural/statistical features generalizes better.
+
+---
+
+## Pipeline
 
 ```
-.
-├── 📁 data/                          # Dataset directory (gitignored)
-│   ├── 📁 raw/                       # Immutable, raw downloaded datasets
-│   └── 📁 processed/                 # Cleaned datasets and feature sets
-│
-├── 📁 notebooks/                     # Exploratory Data Analysis
-│   ├── 01_eda_starter.py             # Basic EDA, schemas, imbalances
-│   └── 01_advanced_eda.py            # Advanced stylometric feature distribution
-│
-├── 📁 src/                           # Source Code
-│   └── 📁 data/                      # Data engineering modules
-│       └── 🐍 download_data.py       # Kaggle download & directory scaffolding script
-│
-├── ⚙️ environment.yml                # Conda dependencies
-├── .gitignore                        
-└── README.md
+data/raw/Task_A/
+  train.parquet + validation.parquet  →  merged training set
+  test.parquet                        →  hidden test set
+  test_sample.parquet                 →  1000 labeled samples for calibration
+
+src/06_gbdt_ensemble.py
+  [1] Load data
+  [2] Extract 53 features (48 handcrafted + 5 compression)
+  [3] TF-IDF (char 3-5 gram, 50k vocab) + SVD (200 dims)
+  [4] Train LGB + XGB + CatBoost with StratifiedKFold-5
+  [5] Grid-search ensemble weights + threshold on test_sample
+  [6] Generate submission.csv
 ```
 
-## Quick Start
+### Feature Groups (53 total)
+| Group | Count | Examples |
+|---|---|---|
+| Line stats | 8 | avg/std/max line length, indentation stats |
+| Whitespace | 2 | space ratio, tab ratio |
+| Syntax | 9 | bracket counts, keyword ratio, comment ratio |
+| Lexical | 10 | entropy, token diversity, identifier length |
+| Style | 10 | snake_case, operator spacing, nesting depth |
+| Patterns | 9 | duplicate lines, bigram repetition, import density |
+| Compression | 5 | zlib ratio, gzip ratio, byte entropy |
 
-### 1. Setup Environment
-```bash
-conda env create -f environment.yml
-conda activate semeval2026
+---
+
+## Kaggle Workflow
+
+```python
+# Cell 1 — Setup
+!pip install lightgbm xgboost catboost scipy -q
+%cd /kaggle/working
+!rm -rf SemEval-2026-Task-13-SubtaskA
+!git clone https://github.com/gugOfBoat/SemEval-2026-Task-13-SubtaskA.git
+
+# Cell 2 — EDA (generates plots to /kaggle/working/eda_plots/)
+!python SemEval-2026-Task-13-SubtaskA/src/01_eda.py
+
+# Cell 3 — Run pipeline
+!python SemEval-2026-Task-13-SubtaskA/src/06_gbdt_ensemble.py
 ```
 
-### 2. Configure Credentials
-Option A: Place `kaggle.json` in `~/.kaggle/`
-Option B: Create a `.env` file at the root:
-```env
-KAGGLE_USERNAME=your_username
-KAGGLE_KEY=your_api_key
+Data path on Kaggle (read-only):
+```
+/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A/
+  train.parquet
+  validation.parquet
+  test.parquet
+  test_sample.parquet
+  sample_submission.csv
 ```
 
-### 3. Data Ingestion
-Run the data pipeline to automatically download and extract data into `data/raw/`:
-```bash
-python src/data/download_data.py
+---
+
+## Data
+
+```
+data/
+  raw/Task_A/       ← parquet files from Kaggle (not committed)
+  download_data.py  ← Kaggle API download script
 ```
 
-### 4. Exploratory Data Analysis
-Start interacting with the data to investigate features:
-```bash
-# Basic Dataset Inspection (Starter)
-python notebooks/01_eda_starter.py
+Set `KAGGLE_USERNAME` and `KAGGLE_KEY` in `.env` (see `.env.example`).
 
-# Advanced Feature Engineering (Advanced)
-python notebooks/01_advanced_eda.py 
-```
+---
 
-## Task Sub-Objectives
-- **Subtask A**: Binary classification (Human vs. AI-Generated).
-- **Subtask B & C**: Granular generator attribution (e.g., GPT-4 vs Claude-3 vs Gemini).
+## Runtime
+
+~60 minutes CPU-only on Kaggle (no GPU required).
+Output: `submission.csv` in `/kaggle/working/` or `data/processed/v3/`.

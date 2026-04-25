@@ -78,10 +78,10 @@ def expit(x):
 def map_to_family(lang_array):
     fams = []
     for l in lang_array:
-        l = str(l).lower()
-        if l in ["c", "c++"]: fams.append("C_CPP")
-        elif l in ["java", "c#", "go"]: fams.append("JVM_ISH")
-        elif l in ["javascript", "php"]: fams.append("SCRIPTING")
+        l = str(l).lower().strip()
+        if l in ["c", "c++", "cpp", "c#", "csharp"]: fams.append("C_CPP")
+        elif l in ["java", "go", "kotlin", "scala", "groovy"]: fams.append("JVM_ISH")
+        elif l in ["javascript", "php", "ruby", "rust"]: fams.append("SCRIPTING")
         else: fams.append("PYTHON")
     return np.array(fams)
 
@@ -104,18 +104,19 @@ def parse_label(col):
 y_tv = parse_label(tv_df["label"])
 y_ts = parse_label(ts_df["label"])
 
-from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier
 
 log("Training ML Language Inference Model...")
-lang_vect = HashingVectorizer(n_features=10000, analyzer='word', ngram_range=(1,2))
-X_lang_tv = lang_vect.fit_transform(tv_df["text"].fillna("").astype(str).values)
+# Use TfidfVectorizer (with IDF) instead of Hashing to eliminate noise from common keywords ("if", "else")
+lang_vect = TfidfVectorizer(max_features=5000, analyzer='word', ngram_range=(1,2))
+X_lang_tv = lang_vect.fit_transform(tv_df["code"].fillna("").astype(str).values)
 
 lang_clf = SGDClassifier(loss='log_loss', max_iter=20, n_jobs=-1, random_state=42)
 lang_clf.fit(X_lang_tv, tv_df["language"].astype(str).values)
 
 log("Evaluating Inference Accuracy on test_sample...")
-X_lang_ts = lang_vect.transform(ts_df["text"].fillna("").astype(str).values)
+X_lang_ts = lang_vect.transform(ts_df["code"].fillna("").astype(str).values)
 predicted_ts_langs = lang_clf.predict(X_lang_ts)
 
 ts_predicted_families = map_to_family(predicted_ts_langs)
@@ -128,7 +129,7 @@ use_per_family = acc >= 0.85
 if use_per_family: log("✓ Accuracy >= 0.85 → Enabling Per-family tracking.")
     
 log("Inferring language family for 500k test samples...")
-X_lang_te = lang_vect.transform(test_df["text"].fillna("").astype(str).values)
+X_lang_te = lang_vect.transform(test_df["code"].fillna("").astype(str).values)
 test_families = map_to_family(lang_clf.predict(X_lang_te))
 
 tv_families = map_to_family(tv_df["language"].astype(str).values)

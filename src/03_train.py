@@ -197,7 +197,7 @@ def train_xgb(X_tr, y_tr, X_va_in=None, y_va_in=None, X_va_out=None, y_va_out=No
 
 def train_cat(X_tr, y_tr, X_va_in=None, y_va_in=None, X_va_out=None, y_va_out=None, is_soft=False, best_iters=None):
     if cb is None: return None
-    model = cb.CatBoostRegressor(
+    model = cb.CatBoostClassifier(
         loss_function="CrossEntropy",
         iterations=best_iters if best_iters else 1000,
         learning_rate=0.03,
@@ -223,7 +223,7 @@ def predict_ensemble(models, X):
     p_lgb = m_lgb.predict_proba(X)[:, 1] if hasattr(m_lgb, 'predict_proba') else m_lgb.predict(X)
     p_xgb = m_xgb.predict(X)
     if m_cat:
-        p_cat = m_cat.predict(X)
+        p_cat = m_cat.predict_proba(X)[:, 1] if hasattr(m_cat, 'predict_proba') else m_cat.predict(X)
         return (p_lgb + p_xgb + p_cat) / 3.0
     return (p_lgb + p_xgb) / 2.0
 

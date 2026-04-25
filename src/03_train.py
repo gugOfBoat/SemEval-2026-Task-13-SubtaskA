@@ -40,7 +40,15 @@ T0 = time.time()
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR = Path("/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A")
 OUT_DIR  = Path("/kaggle/working")
+
+# Thông minh tìm kiếm các dataset bên ngoài user đính kèm (nếu có .npy)
 FEAT_DIR = Path("/kaggle/working")
+if Path("/kaggle/input").exists():
+    for d in Path("/kaggle/input").rglob("*"):
+        if d.is_dir() and (d / "train_handcraft.npy").exists():
+            FEAT_DIR = d
+            break
+
 if not DATA_DIR.exists():
     # Local dev fallback
     DATA_DIR = Path("../data/raw/Task_A")
@@ -158,9 +166,9 @@ try:
 
     # Track 1 Integration (TF-IDF probabilities)
     try:
-        X_tv_tfidf = np.load(OUT_DIR / "train_tfidf.npy")
-        X_ts_tfidf = np.load(OUT_DIR / "test_sample_tfidf.npy")
-        X_te_tfidf = np.load(OUT_DIR / "test_tfidf.npy")
+        X_tv_tfidf = np.load(FEAT_DIR / "train_tfidf.npy")
+        X_ts_tfidf = np.load(FEAT_DIR / "test_sample_tfidf.npy")
+        X_te_tfidf = np.load(FEAT_DIR / "test_tfidf.npy")
         
         X_tv = np.hstack([X_tv, X_tv_tfidf])
         X_ts = np.hstack([X_ts, X_ts_tfidf])

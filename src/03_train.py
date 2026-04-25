@@ -58,44 +58,30 @@ def divider(title):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 0. INFER LANGUAGE FAMILY
+# 0. HELPER FUNCTIONS: LOGIT SHIFTING
 # ═══════════════════════════════════════════════════════════════════════════════
+def logit(p):
+    p = np.clip(p, 1e-7, 1 - 1e-7)
+    return np.log(p / (1 - p))
 
-def infer_family_from_code(code: str) -> str:
-    """
-    Phân loại code thành 4 họ ngôn ngữ chính (để áp dụng ngưỡng OOD calibrate).
-    C_CPP, PYTHON, JVM_ISH (Java/C#/Go), SCRIPTING (JS/PHP)
-    """
-    if not isinstance(code, str) or not code:
-        return "PYTHON" # Fallback đa số
-    
-    # PHP
-    if "<?php" in code or "$_" in code or "echo " in code:
-        return "SCRIPTING"
-    # JS
-    if "console.log" in code or "function(" in code or "const " in code or "let " in code or "=>" in code:
-        return "SCRIPTING"
-    # Go
-    if "package main" in code or "func " in code or "fmt." in code or "import (" in code:
-        return "JVM_ISH"
-    # Java / C#
-    if "public static void main" in code or "System.out.println" in code or "using System" in code or "namespace " in code:
-        return "JVM_ISH"
-    # C/C++
-    if "#include" in code or "std::" in code or "int main" in code or "printf" in code:
-        return "C_CPP"
-    # Python
-    if "def " in code or "import " in code or "print(" in code or "class " in code:
-        return "PYTHON"
-    
-    return "PYTHON" # Fallback default
+def expit(x):
+    return 1 / (1 + np.exp(-x))
+
+def map_to_family(lang_array):
+    fams = []
+    for l in lang_array:
+        l = str(l).lower()
+        if l in ["c", "c++"]: fams.append("C_CPP")
+        elif l in ["java", "c#", "go"]: fams.append("JVM_ISH")
+        elif l in ["javascript", "php"]: fams.append("SCRIPTING")
+        else: fams.append("PYTHON")
+    return np.array(fams)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 1. LOAD DATA & FEATURES
+# 1. LOAD TEXT DATA & CLASSIFY LANGUAGES
 # ═══════════════════════════════════════════════════════════════════════════════
-divider("Loading Data & Features")
+divider("Loading Text Data & Classifying Languages")
 
-# Load labels
 train_df = pd.read_parquet(DATA_DIR / "train.parquet")
 val_df   = pd.read_parquet(DATA_DIR / "validation.parquet")
 tv_df    = pd.concat([train_df, val_df], ignore_index=True)
@@ -110,12 +96,66 @@ def parse_label(col):
 y_tv = parse_label(tv_df["label"])
 y_ts = parse_label(ts_df["label"])
 
-# Load features
+from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.linear_model import SGDClassifier
+
+log("Training ML Language Inference Model...")
+lang_vect = HashingVectorizer(n_features=10000, analyzer='word', ngram_range=(1,2))
+X_lang_tv = lang_vect.fit_transform(tv_df["code"].fillna("").astype(str).values)
+
+lang_clf = SGDClassifier(loss='log_loss', max_iter=20, n_jobs=-1, random_state=42)
+lang_clf.fit(X_lang_tv, tv_df["language"].astype(str).values)
+
+log("Evaluating Inference Accuracy on test_sample...")
+X_lang_ts = lang_vect.transform(ts_df["code"].fillna("").astype(str).values)
+predicted_ts_langs = lang_clf.predict(X_lang_ts)
+
+ts_predicted_families = map_to_family(predicted_ts_langs)
+ts_actual_families = map_to_family(ts_df["language"].astype(str).values)
+
+acc = np.mean(ts_predicted_families == ts_actual_families)
+log(f"Family Inference Accuracy: {acc:.4f} -> {'PASS' if acc >= 0.85 else 'FAIL'}")
+
+use_per_family = acc >= 0.85
+if use_per_family: log("✓ Accuracy >= 0.85 → Enabling Per-family tracking.")
+    
+log("Inferring language family for 500k test samples...")
+X_lang_te = lang_vect.transform(test_df["code"].fillna("").astype(str).values)
+test_families = map_to_family(lang_clf.predict(X_lang_te))
+
+tv_families = map_to_family(tv_df["language"].astype(str).values)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. LOAD FEATURES AND NEUTRALIZE
+# ═══════════════════════════════════════════════════════════════════════════════
+divider("Loading & Neutralizing Features")
+
 try:
     X_tv = np.load(FEAT_DIR / "train_handcraft.npy")
     X_ts = np.load(FEAT_DIR / "test_sample_handcraft.npy")
     X_te = np.load(FEAT_DIR / "test_handcraft.npy")
     
+    log(f"  Loaded Handcrafted arrays... Shape: {X_tv.shape}")
+    
+    # Feature Neutralization
+    log("  Applying Feature Neutralization (Division by Train Family Medians) ...")
+    medians = {}
+    for fam in np.unique(tv_families):
+        fam_mask = (tv_families == fam)
+        # Add epsilon to prevent div zero
+        fam_median = np.median(X_tv[fam_mask], axis=0) + 1e-9
+        medians[fam] = fam_median
+        X_tv[fam_mask] /= fam_median
+
+    for fam, med in medians.items():
+        ts_mask = (ts_predicted_families == fam)
+        if ts_mask.sum() > 0: X_ts[ts_mask] /= med
+        
+        te_mask = (test_families == fam)
+        if te_mask.sum() > 0: X_te[te_mask] /= med
+        
+    log("  ✓ Feature Shift Neutralized.")
+
     # Track 1 Integration (TF-IDF probabilities)
     try:
         X_tv_tfidf = np.load(OUT_DIR / "train_tfidf.npy")
@@ -125,7 +165,7 @@ try:
         X_tv = np.hstack([X_tv, X_tv_tfidf])
         X_ts = np.hstack([X_ts, X_ts_tfidf])
         X_te = np.hstack([X_te, X_te_tfidf])
-        log("Successfully integrated TF-IDF Semantic Track probabilities (+1 feature).")
+        log("Successfully integrated TF-IDF Semantic Track (+ features).")
     except FileNotFoundError:
         log("⚠ TF-IDF Track features absent. Using only Handcrafted Track features.")
         
@@ -135,39 +175,7 @@ except FileNotFoundError:
     X_ts = np.random.randn(len(y_ts), 30).astype(np.float32)
     X_te = np.random.randn(len(test_df), 30).astype(np.float32)
 
-log(f"Train/Val: {X_tv.shape} | Test Sample: {X_ts.shape} | Test: {X_te.shape}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 1.5 CHECK LANGUAGE FAMILY GATEKEEPER
-# ═══════════════════════════════════════════════════════════════════════════════
-log("Checking Infer Family Accuracy on test_sample...")
-ts_codes = ts_df["code"].fillna("").values
-predicted_families = [infer_family_from_code(c) for c in ts_codes]
-
-actual_families = []
-for lang in ts_df["language"]:
-    l = str(lang).lower()
-    if l in ["c", "c++"]:
-        actual_families.append("C_CPP")
-    elif l in ["java", "c#", "go"]:
-        actual_families.append("JVM_ISH")
-    elif l in ["javascript", "php"]:
-        actual_families.append("SCRIPTING")
-    else:
-        actual_families.append("PYTHON")
-
-acc = np.mean(np.array(predicted_families) == np.array(actual_families))
-log(f"Family Inference Accuracy: {acc:.4f}")
-use_per_family = acc >= 0.85
-if not use_per_family:
-    log("⚠ Accuracy < 0.85 → Falling back to global thresholding.")
-else:
-    log("✅ Gatekeeper passed. We will use per-family thresholds.")
-
-# Cache test families
-test_codes = test_df["code"].fillna("").values
-log("Inferring language family for 500k test samples...")
-test_families = np.array([infer_family_from_code(c) for c in test_codes])
+log(f"Final Matrix => Train/Val: {X_tv.shape} | Test Sample: {X_ts.shape} | Test: {X_te.shape}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -306,42 +314,43 @@ log(f"    Macro F1 on test_sample: {initial_f1:.4f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. PER-FAMILY THRESHOLD CALIBRATION
+# 4. PER-FAMILY CALIBRATION VIA LOGIT SHIFT
 # ═══════════════════════════════════════════════════════════════════════════════
-divider("Per-family Threshold Calibration")
+divider("Per-family Calibration via Logit Shift")
 
-# We will use y_ts_oof probabilities to calibrate the threshold for each family.
-# Note: we use `y_ts_oof` because it was NOT trained on during generating OOF.
 actual_families_np = np.array(actual_families)
-thresholds = {"PYTHON": 0.5, "JVM_ISH": 0.5, "C_CPP": 0.5, "SCRIPTING": 0.5}
+shifts = {"PYTHON": 0.0, "JVM_ISH": 0.0, "C_CPP": 0.0, "SCRIPTING": 0.0}
 
 if use_per_family:
-    for fam in thresholds.keys():
+    for fam in shifts.keys():
         fam_idx = np.where(actual_families_np == fam)[0]
         if len(fam_idx) < 10:
-            log(f"  Family {fam:10s}: Insufficient sample size ({len(fam_idx)}). Using 0.5")
+            log(f"  Family {fam:10s}: Insufficient sample. Using shift 0.0")
             continue
             
-        best_t, best_f1 = 0.5, 0.0
-        for t in np.arange(0.3, 0.71, 0.02):
-            preds = (y_ts_oof[fam_idx] > t).astype(int)
+        best_s, best_f1 = 0.0, 0.0
+        # Search shift s over [-3.0, 3.0] space
+        y_fam_logits = logit(y_ts_oof[fam_idx])
+        for s in np.arange(-3.0, 3.1, 0.1):
+            preds = (expit(y_fam_logits + s) > 0.5).astype(int)
             f1 = f1_score(y_ts[fam_idx], preds, average="macro")
             if f1 > best_f1:
                 best_f1 = f1
-                best_t = float(t)
-        thresholds[fam] = best_t
-        log(f"  Family {fam:10s}: selected threshold {best_t:.2f} (F1={best_f1:.4f} | n={len(fam_idx)})")
+                best_s = float(s)
+        shifts[fam] = best_s
+        log(f"  Family {fam:10s}: selected shift {best_s:+.2f} (F1={best_f1:.4f} | n={len(fam_idx)})")
 
 else:
-    best_t, best_f1 = 0.5, 0.0
-    for t in np.arange(0.3, 0.71, 0.02):
-        preds = (y_ts_oof > t).astype(int)
+    best_s, best_f1 = 0.0, 0.0
+    y_logits = logit(y_ts_oof)
+    for s in np.arange(-3.0, 3.1, 0.1):
+        preds = (expit(y_logits + s) > 0.5).astype(int)
         f1 = f1_score(y_ts, preds, average="macro")
         if f1 > best_f1:
             best_f1 = f1
-            best_t = float(t)
-    for fam in thresholds: thresholds[fam] = best_t
-    log(f"  Global calibration: selected threshold {best_t:.2f} (F1={best_f1:.4f})")
+            best_s = float(s)
+    for fam in shifts: shifts[fam] = best_s
+    log(f"  Global calibration: selected shift {best_s:+.2f} (F1={best_f1:.4f})")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. SUBMISSION
@@ -349,9 +358,11 @@ else:
 divider("Generate Submission")
 
 test_preds = np.zeros(len(test_probs_initial), dtype=int)
-for fam, t in thresholds.items():
+test_logits = logit(test_probs_initial)
+
+for fam, s in shifts.items():
     fam_idx = np.where(test_families == fam)[0]
-    test_preds[fam_idx] = (test_probs_initial[fam_idx] > t).astype(int)
+    test_preds[fam_idx] = (expit(test_logits[fam_idx] + s) > 0.5).astype(int)
 
 ai_ratio = test_preds.mean()
 log(f"  Final AI ratio on 500k test set: {ai_ratio:.2%}")

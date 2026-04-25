@@ -96,74 +96,76 @@ X_te_sparse = tfidf.transform(X_te_text)
 log(f"  Test Sample Sparse bounds: {X_ts_sparse.shape}")
 log(f"  Test Sparse bounds:        {X_te_sparse.shape}")
 
-# Free huge string ram
+import re
+from sklearn.decomposition import TruncatedSVD
+
+log("Skeletonizing texts... (Stripping alphanumerics)")
+# Keep only punctuation, whitespace, brackets, parentheses.
+def skeletonize(code_array):
+    out = []
+    for c in code_array:
+        # sub out a-z, A-Z, 0-9
+        s = re.sub(r'[a-zA-Z0-9_]+', '', c)
+        out.append(s)
+    return out
+
+X_tv_skel = skeletonize(X_tv_text)
+X_ts_skel = skeletonize(X_ts_text)
+X_te_skel = skeletonize(X_te_text)
+
 del X_tv_text, X_ts_text, X_te_text
 gc.collect()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. TRAIN OOF (OUT-OF-FOLD) CALIBRATION
+# 2. FIT TF-IDF
 # ═══════════════════════════════════════════════════════════════════════════════
-divider("Training OOF K-Fold Models (LogisticRegression)")
+divider("Extracting Sparse Semantic Features (TF-IDF)")
 
-# Out-of-fold array for the train set
-oof_probs = np.zeros(len(y_tv), dtype=np.float32)
-# Final test predictions arrays
-test_preds = np.zeros(X_te_sparse.shape[0], dtype=np.float32)
-ts_preds   = np.zeros(X_ts_sparse.shape[0], dtype=np.float32)
+tfidf = TfidfVectorizer(
+    analyzer='char_wb',
+    ngram_range=(2, 6),   # 2 to 6 character sweeps on punctuation only
+    max_features=20000,
+    min_df=5,
+    max_df=0.7,
+    lowercase=False,
+    dtype=np.float32,
+)
 
-kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+log("Fitting Vectorizer on Train/Val... ")
+X_tv_sparse = tfidf.fit_transform(X_tv_skel)
+log(f"  Train/Val Sparse Matrix: {X_tv_sparse.shape}")
 
-for fold, (trn_idx, val_idx) in enumerate(kf.split(X_tv_sparse, y_tv)):
-    t_f0 = time.time()
-    
-    # Train test split for fold
-    X_f_tr, y_f_tr = X_tv_sparse[trn_idx], y_tv[trn_idx]
-    X_f_val, y_f_val = X_tv_sparse[val_idx], y_tv[val_idx]
-    
-    # Use Saga solver for ultra-fast sparse matrix convergence
-    clf = LogisticRegression(
-        C=0.5,                  # Strong L2 regularization to prevent overfitting 30k vectors
-        solver='saga', 
-        max_iter=100, 
-        n_jobs=-1,
-        random_state=42
-    )
-    clf.fit(X_f_tr, y_f_tr)
-    
-    # Validation
-    val_probs = clf.predict_proba(X_f_val)[:, 1]
-    oof_probs[val_idx] = val_probs
-    
-    # Collect predictions for testing bounds
-    ts_preds += clf.predict_proba(X_ts_sparse)[:, 1] / 5.0
-    test_preds += clf.predict_proba(X_te_sparse)[:, 1] / 5.0
-    
-    fold_auc = roc_auc_score(y_f_val, val_probs)
-    fold_f1  = f1_score(y_f_val, (val_probs > 0.5).astype(int), average='macro')
-    
-    log(f"  Fold {fold+1} | AUC: {fold_auc:.4f} | F1: {fold_f1:.4f} | Time: {(time.time()-t_f0)/60:.1f}m")
+log("Transforming Test sets...")
+X_ts_sparse = tfidf.transform(X_ts_skel)
+X_te_sparse = tfidf.transform(X_te_skel)
 
-# Global OOF Review
-cv_auc = roc_auc_score(y_tv, oof_probs)
-cv_f1  = f1_score(y_tv, (oof_probs > 0.5).astype(int), average='macro')
-log(f"\n  Final OOF AUC: {cv_auc:.4f}")
-log(f"  Final OOF F1:  {cv_f1:.4f}")
-
-# Eval on unseen test_sample
-gold_auc = roc_auc_score(y_ts, ts_preds)
-gold_f1  = f1_score(y_ts, (ts_preds > 0.5).astype(int), average='macro')
-log(f"\n  Test_Sample GOLD AUC: {gold_auc:.4f}")
-log(f"  Test_Sample GOLD F1:  {gold_f1:.4f}")
+del X_tv_skel, X_ts_skel, X_te_skel
+gc.collect()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. EXPORT PROBABILITIES AS FEATURE
+# 3. SVD COMPRESSION
 # ═══════════════════════════════════════════════════════════════════════════════
-divider("Exporting TF-IDF Features")
+divider("Dimensionality Reduction (TruncatedSVD)")
 
-# Save as (N, 1) column vectors mapping to probability of being AI
-np.save(OUT_DIR / "train_tfidf.npy", oof_probs.reshape(-1, 1))
-np.save(OUT_DIR / "test_sample_tfidf.npy", ts_preds.reshape(-1, 1))
-np.save(OUT_DIR / "test_tfidf.npy", test_preds.reshape(-1, 1))
+# Extract top 20 structural/semantic patterns into dense vectors
+svd = TruncatedSVD(n_components=20, random_state=42)
 
-log(f"  Exported 1-dimensional Semantic Trajectory Features.")
+log("Fitting SVD on Train/Val matrix...")
+X_tv_svd = svd.fit_transform(X_tv_sparse)
+log(f"  Explained variance ratio: {svd.explained_variance_ratio_.sum():.4f}")
+
+log("Transforming Test matrices...")
+X_ts_svd = svd.transform(X_ts_sparse)
+X_te_svd = svd.transform(X_te_sparse)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. EXPORT SVD FEATURES
+# ═══════════════════════════════════════════════════════════════════════════════
+divider("Exporting SVD Features")
+
+np.save(OUT_DIR / "train_tfidf.npy", X_tv_svd.astype(np.float32))
+np.save(OUT_DIR / "test_sample_tfidf.npy", X_ts_svd.astype(np.float32))
+np.save(OUT_DIR / "test_tfidf.npy", X_te_svd.astype(np.float32))
+
+log(f"  Exported 20-dimensional Structural Trajectory Features.")
 log(f"  Pipeline total time: {(time.time() - T0)/60:.1f}m")

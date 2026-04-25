@@ -426,12 +426,9 @@ for rank, (fname, imp) in enumerate(adv_ranking):
     tag = " ← DROP" if rank < 10 else ""
     log(f"    {rank+1:2d}. {fname:25s} gain={imp:8.1f}{tag}")
 
-# Drop top 10 OOD-leaky features
-to_drop_adv = set(f for f, _ in adv_ranking[:10])
-feat_cols = [f for f in feat_cols if f not in to_drop_adv]
-
-log(f"\n  Adversarial filter: dropped {len(to_drop_adv)} → {len(feat_cols)} features remain")
-log(f"  Dropped: {sorted(to_drop_adv)}")
+# Prevent dropping! We will use Feature Neutralization later in 03_train.py
+to_drop_adv = set()
+log("\n  Adversarial filter: SKIPPING FEATURE DROP - WE WILL NEUTRALIZE FEATURES IN 03_TRAIN.PY INSTEAD.")
 
 # Plot adversarial importance
 fig, ax = plt.subplots(figsize=(10, 6))

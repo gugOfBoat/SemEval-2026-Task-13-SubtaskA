@@ -318,7 +318,7 @@ log(f"    Macro F1 on test_sample: {initial_f1:.4f}")
 # ═══════════════════════════════════════════════════════════════════════════════
 divider("Per-family Calibration via Logit Shift")
 
-actual_families_np = np.array(actual_families)
+actual_families_np = np.array(ts_actual_families)
 shifts = {"PYTHON": 0.0, "JVM_ISH": 0.0, "C_CPP": 0.0, "SCRIPTING": 0.0}
 
 if use_per_family:

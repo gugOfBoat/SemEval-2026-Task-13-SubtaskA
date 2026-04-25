@@ -40,17 +40,16 @@ T0 = time.time()
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR = Path("/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A")
 OUT_DIR  = Path("/kaggle/working")
+FEAT_DIR = Path("/kaggle/working")
 
-import os
-FEAT_DIR = Path("/kaggle/input") if not Path("/kaggle/working/train_handcraft.npy").exists() else Path("/kaggle/working")
-if Path("/kaggle/input").exists():
-    for root, dirs, files in os.walk("/kaggle/input"):
-        if "train_handcraft.npy" in files:
-            FEAT_DIR = Path(root)
-            break
+# Fallbacks specifically for the user's dataset
+for test_dir in ["/kaggle/input/semeval", "/kaggle/input/notebooks/thtynn/semeval"]:
+    p = Path(test_dir)
+    if (p / "train_handcraft.npy").exists():
+        FEAT_DIR = p
+        break
 
 if not DATA_DIR.exists():
-    # Local dev fallback
     DATA_DIR = Path("../data/raw/Task_A")
     OUT_DIR  = Path(".")
     FEAT_DIR = Path(".")
@@ -104,45 +103,42 @@ def parse_label(col):
 y_tv = parse_label(tv_df["label"])
 y_ts = parse_label(ts_df["label"])
 
-log("Applying Deterministic Language Inference Model...")
+log("Training ML Language Inference Model...")
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import SGDClassifier
 import re
 
-def infer_family_heuristics(codes):
-    preds = []
+def clean_code(codes):
+    cleaned = []
     for c in codes:
-        c = str(c).lower()
-        if "```cpp" in c or "```c++" in c or "```c\n" in c: 
-            preds.append("C_CPP"); continue
-        if "```java" in c or "```go" in c or "```c#" in c: 
-            preds.append("JVM_ISH"); continue
-        if "```python" in c: 
-            preds.append("PYTHON"); continue
-        if "```javascript" in c or "```php" in c or "```ruby" in c or "```rust" in c:
-            preds.append("SCRIPTING"); continue
-            
-        counts = {
-            "PYTHON": c.count("def ") + c.count("import ") + c.count("print(") + c.count("self.") + c.count("elif "),
-            "C_CPP": c.count("#include") + c.count("std::") + c.count("cout") + c.count("using namespace") + c.count("int main"),
-            "JVM_ISH": c.count("public class") + c.count("system.out") + c.count("namespace ") + c.count("package main") + c.count("func "),
-            "SCRIPTING": c.count("console.log") + c.count("<?php") + c.count("let ") + c.count("const ") + c.count("=>") + c.count("function")
-        }
-        
-        best = max(counts, key=counts.get)
-        preds.append(best if counts[best] > 0 else "PYTHON")
-    return np.array(preds)
+        # Strip AI markdown enclosures
+        c = re.sub(r"```[a-zA-Z#+]*\n", "", str(c))
+        c = c.replace("```", "")
+        cleaned.append(c)
+    return np.array(cleaned)
+
+lang_vect = TfidfVectorizer(max_features=10000, analyzer='char_wb', ngram_range=(3,5))
+
+# Learn structural patterns
+X_lang_tv = lang_vect.fit_transform(clean_code(tv_df["code"].fillna("").values))
+tv_families_target = map_to_family(tv_df["language"].astype(str).values)
+
+lang_clf = SGDClassifier(loss='log_loss', max_iter=20, n_jobs=-1, random_state=42)
+lang_clf.fit(X_lang_tv, tv_families_target)
 
 log("Evaluating Inference Accuracy on test_sample...")
-ts_predicted_families = infer_family_heuristics(ts_df["code"].values)
+X_lang_ts = lang_vect.transform(clean_code(ts_df["code"].fillna("").values))
+ts_predicted_families = lang_clf.predict(X_lang_ts)
 ts_actual_families = map_to_family(ts_df["language"].astype(str).values)
 
 acc = np.mean(ts_predicted_families == ts_actual_families)
 log(f"Family Inference Accuracy: {acc:.4f}")
 
-# Force using per-family even if accuracy drops to 50% for OOD test protection!
 use_per_family = True
     
 log("Inferring language family for 500k test samples...")
-test_families = infer_family_heuristics(test_df["code"].values)
+X_lang_te = lang_vect.transform(clean_code(test_df["code"].fillna("").values))
+test_families = lang_clf.predict(X_lang_te)
 
 tv_families = map_to_family(tv_df["language"].astype(str).values)
 

@@ -536,11 +536,11 @@ X_train_final = df_feat_train[selected_features].values.astype(np.float32)
 X_test_final  = df_feat_test[selected_features].values.astype(np.float32)
 X_ts_final    = df_feat_ts[selected_features].values.astype(np.float32)
 
-np.save(DATA_DIR / "train_handcraft.npy", X_train_final)
-np.save(DATA_DIR / "test_handcraft.npy", X_test_final)
-np.save(DATA_DIR / "test_sample_handcraft.npy", X_ts_final)
+np.save(OUT_DIR / "train_handcraft.npy", X_train_final)
+np.save(OUT_DIR / "test_handcraft.npy", X_test_final)
+np.save(OUT_DIR / "test_sample_handcraft.npy", X_ts_final)
 
-with open(DATA_DIR / "feature_meta.json", "w") as f:
+with open(OUT_DIR / "feature_meta.json", "w") as f:
     json.dump({
         "n_features": len(selected_features),
         "features": selected_features,

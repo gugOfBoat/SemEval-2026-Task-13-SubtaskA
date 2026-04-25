@@ -39,10 +39,12 @@ T0 = time.time()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_DIR = Path("/kaggle/input/competitions/sem-eval-2026-task-13-subtask-a/Task_A")
+OUT_DIR  = Path("/kaggle/working")
 FEAT_DIR = Path("/kaggle/working")
 if not DATA_DIR.exists():
     # Local dev fallback
     DATA_DIR = Path("../data/raw/Task_A")
+    OUT_DIR  = Path(".")
     FEAT_DIR = Path(".")
 
 def log(msg):    

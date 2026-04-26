@@ -102,31 +102,35 @@ def parse_label(col):
 
 y_tv = parse_label(tv_df["label"])
 y_ts = parse_label(ts_df["label"])
+log("Applying Deterministic Language Inference Model...")
+import re
 
-log("Training ML Language Inference Model (using 50k subset to prevent OOM)...")
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import SGDClassifier
-
-def clean_code(codes):
-    return [str(c).replace("```", "") for c in codes]
-
-lang_vect = TfidfVectorizer(max_features=10000, analyzer='char_wb', ngram_range=(3,5))
-
-# Learn structural patterns on a safe 50k subset to prevent RAM explosion
-np.random.seed(42)
-sample_idx = np.random.choice(len(tv_df), min(50000, len(tv_df)), replace=False)
-subset_codes = tv_df["code"].fillna("").values[sample_idx]
-subset_langs = tv_df["language"].astype(str).values[sample_idx]
-
-X_lang_tv = lang_vect.fit_transform(clean_code(subset_codes))
-tv_families_target = map_to_family(subset_langs)
-
-lang_clf = SGDClassifier(loss='log_loss', max_iter=20, n_jobs=-1, random_state=42)
-lang_clf.fit(X_lang_tv, tv_families_target)
+def infer_family_heuristics(codes):
+    preds = []
+    for c in codes:
+        c = str(c).lower()
+        if "```cpp" in c or "```c++" in c or "```c\n" in c: 
+            preds.append("C_CPP"); continue
+        if "```java" in c or "```go" in c or "```c#" in c: 
+            preds.append("JVM_ISH"); continue
+        if "```python" in c: 
+            preds.append("PYTHON"); continue
+        if "```javascript" in c or "```php" in c or "```ruby" in c or "```rust" in c:
+            preds.append("SCRIPTING"); continue
+            
+        counts = {
+            "PYTHON": c.count("def ") + c.count("import ") + c.count("print(") + c.count("self.") + c.count("elif "),
+            "C_CPP": c.count("#include") + c.count("std::") + c.count("cout") + c.count("using namespace") + c.count("int main"),
+            "JVM_ISH": c.count("public class") + c.count("system.out") + c.count("namespace ") + c.count("package main") + c.count("func "),
+            "SCRIPTING": c.count("console.log") + c.count("<?php") + c.count("let ") + c.count("const ") + c.count("=>") + c.count("function")
+        }
+        
+        best = max(counts, key=counts.get)
+        preds.append(best if counts[best] > 0 else "PYTHON")
+    return np.array(preds)
 
 log("Evaluating Inference Accuracy on test_sample...")
-X_lang_ts = lang_vect.transform(clean_code(ts_df["code"].fillna("").values))
-ts_predicted_families = lang_clf.predict(X_lang_ts)
+ts_predicted_families = infer_family_heuristics(ts_df["code"].values)
 ts_actual_families = map_to_family(ts_df["language"].astype(str).values)
 
 acc = np.mean(ts_predicted_families == ts_actual_families)
@@ -337,38 +341,35 @@ log(f"    Macro F1 on test_sample: {initial_f1:.4f}")
 divider("Per-family Calibration via Logit Shift")
 
 actual_families_np = np.array(ts_actual_families)
-shifts = {"PYTHON": 0.0, "JVM_ISH": 0.0, "C_CPP": 0.0, "SCRIPTING": 0.0}
+thresholds = {"PYTHON": 0.5, "JVM_ISH": 0.5, "C_CPP": 0.5, "SCRIPTING": 0.5}
 
 if use_per_family:
-    for fam in shifts.keys():
+    for fam in thresholds.keys():
         fam_idx = np.where(actual_families_np == fam)[0]
         if len(fam_idx) < 10:
-            log(f"  Family {fam:10s}: Insufficient sample. Using shift 0.0")
+            log(f"  Family {fam:10s}: Insufficient sample. Using threshold 0.5")
             continue
             
-        best_s, best_f1 = 0.0, 0.0
-        # Search shift s over [-3.0, 3.0] space
-        y_fam_logits = logit(y_ts_oof[fam_idx])
-        for s in np.arange(-3.0, 3.1, 0.1):
-            preds = (expit(y_fam_logits + s) > 0.5).astype(int)
+        best_t, best_f1 = 0.5, 0.0
+        for t in np.arange(0.1, 0.95, 0.05):
+            preds = (y_ts_oof[fam_idx] >= t).astype(int)
             f1 = f1_score(y_ts[fam_idx], preds, average="macro")
             if f1 > best_f1:
                 best_f1 = f1
-                best_s = float(s)
-        shifts[fam] = best_s
-        log(f"  Family {fam:10s}: selected shift {best_s:+.2f} (F1={best_f1:.4f} | n={len(fam_idx)})")
+                best_t = float(t)
+        thresholds[fam] = best_t
+        log(f"  Family {fam:10s}: selected threshold {best_t:.2f} (F1={best_f1:.4f} | n={len(fam_idx)})")
 
 else:
-    best_s, best_f1 = 0.0, 0.0
-    y_logits = logit(y_ts_oof)
-    for s in np.arange(-3.0, 3.1, 0.1):
-        preds = (expit(y_logits + s) > 0.5).astype(int)
+    best_t, best_f1 = 0.5, 0.0
+    for t in np.arange(0.1, 0.95, 0.05):
+        preds = (y_ts_oof >= t).astype(int)
         f1 = f1_score(y_ts, preds, average="macro")
         if f1 > best_f1:
             best_f1 = f1
-            best_s = float(s)
-    for fam in shifts: shifts[fam] = best_s
-    log(f"  Global calibration: selected shift {best_s:+.2f} (F1={best_f1:.4f})")
+            best_t = float(t)
+    for fam in thresholds: thresholds[fam] = best_t
+    log(f"  Global calibration: selected threshold {best_t:.2f} (F1={best_f1:.4f})")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. SUBMISSION
@@ -376,11 +377,10 @@ else:
 divider("Generate Submission")
 
 test_preds = np.zeros(len(test_probs_initial), dtype=int)
-test_logits = logit(test_probs_initial)
 
-for fam, s in shifts.items():
+for fam, t in thresholds.items():
     fam_idx = np.where(test_families == fam)[0]
-    test_preds[fam_idx] = (expit(test_logits[fam_idx] + s) > 0.5).astype(int)
+    test_preds[fam_idx] = (test_probs_initial[fam_idx] >= t).astype(int)
 
 ai_ratio = test_preds.mean()
 log(f"  Final AI ratio on 500k test set: {ai_ratio:.2%}")

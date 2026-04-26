@@ -139,8 +139,7 @@ log(f"Family Inference Accuracy: {acc:.4f}")
 use_per_family = True
     
 log("Inferring language family for 500k test samples...")
-X_lang_te = lang_vect.transform(clean_code(test_df["code"].fillna("").values))
-test_families = lang_clf.predict(X_lang_te)
+test_families = infer_family_heuristics(test_df["code"].values)
 
 tv_families = map_to_family(tv_df["language"].astype(str).values)
 

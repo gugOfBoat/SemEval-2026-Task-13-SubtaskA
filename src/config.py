@@ -72,10 +72,10 @@ class PipelineConfig:
         "/kaggle/input/qwen2.5-coder/transformers/1.5b-instruct/1",
         "Qwen/Qwen2.5-Coder-0.5B-Instruct",
     ])
-    ppl_max_tokens: int = 64
-    ppl_batch_size: int = 64
-    ppl_train_subsample: int = 50_000
-    ppl_time_budget_sec: int = 7200
+    ppl_max_tokens: int = 128
+    ppl_batch_size: int = 128
+    ppl_train_subsample: int = 150_000
+    ppl_time_budget_sec: int = 25_200  # 7 hours
 
     # --- Stacking Meta-Learner ---
     n_folds: int = 5

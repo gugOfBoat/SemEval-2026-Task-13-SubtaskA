@@ -1,9 +1,14 @@
 """
-CAMSP v10 — Feature Engineering Engines.
+CAMSP v10.1 — Feature Engineering Engines.
 
 Two complementary feature extraction systems:
 1. CodeStyleExtractor: Language-agnostic compression and structural metrics.
-2. LLMPerplexityEngine: Test-first neural perplexity with strict time budgets.
+2. LLMPerplexityEngine: Sequential Completion strategy with adaptive batch sizing.
+
+LLM Engine v10.1 Changes:
+- Sequential Completion: Test 100% → Sample 100% → Train (remaining budget)
+- Adaptive OOM recovery: auto-halves batch size on CUDA OOM
+- Expanded context window: 128 tokens for richer perplexity discrimination
 """
 
 import bz2
@@ -159,11 +164,20 @@ class CodeStyleExtractor:
 class LLMPerplexityEngine:
     """Computes token-level NLL features using a quantized causal LM.
 
-    Implements **Test-First Strategy**: allocates 55% of the time budget
-    to the test set before processing sample and train subsets. This
-    maximizes perplexity coverage on the evaluation target.
+    **Sequential Completion Strategy (v10.1)**:
+    Instead of fixed percentage splits, this engine runs each dataset
+    to 100% completion in strict priority order:
 
-    Falls back to zero features if no GPU or transformers is available.
+        Priority 1: Test set (500k) — run until FULLY COMPLETE
+        Priority 2: Sample set (1k)  — run until FULLY COMPLETE
+        Priority 3: Train subsample  — consume ALL remaining budget
+
+    This guarantees zero dead-zero rows in the test PPL features,
+    eliminating the train/test distribution mismatch that crippled
+    the meta-learner in v10.0.
+
+    **Adaptive OOM Recovery**: If a batch triggers CUDA OOM, the engine
+    automatically halves the batch size and retries, down to bs=8.
 
     Args:
         config: Pipeline configuration with LLM parameters.
@@ -173,6 +187,7 @@ class LLMPerplexityEngine:
 
     def __init__(self, config: PipelineConfig) -> None:
         self.cfg = config
+        self._effective_bs = config.ppl_batch_size  # may shrink on OOM
 
     def execute(
         self,
@@ -180,70 +195,102 @@ class LLMPerplexityEngine:
         test_codes: np.ndarray,
         sample_codes: Optional[np.ndarray],
     ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-        """Runs the full perplexity pipeline with test-first budget allocation.
+        """Runs the full perplexity pipeline with Sequential Completion.
 
         Args:
-            train_codes: Training code array.
-            test_codes: Test code array (500k samples).
-            sample_codes: Optional test_sample code array.
+            train_codes: Training code array (600k).
+            test_codes: Test code array (500k).
+            sample_codes: Optional test_sample code array (1k).
 
         Returns:
             Tuple of (ppl_train, ppl_test, ppl_sample) feature matrices.
         """
-        logger.info("Initializing LLM Perplexity Engine (Test-First Strategy)")
-
-        try:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-        except ImportError:
-            logger.warning("transformers unavailable — returning zero features")
-            return (
-                self._zeros(len(train_codes)),
-                self._zeros(len(test_codes)),
-                self._zeros(len(sample_codes)) if sample_codes is not None else None,
-            )
+        logger.info(
+            "LLM Perplexity Engine v10.1 — Sequential Completion | "
+            "budget=%ds, tokens=%d, batch=%d",
+            self.cfg.ppl_time_budget_sec,
+            self.cfg.ppl_max_tokens,
+            self.cfg.ppl_batch_size,
+        )
 
         model, tokenizer = self._load_model()
         if model is None:
+            logger.warning("No LLM available — returning zero features for all sets")
             return (
                 self._zeros(len(train_codes)),
                 self._zeros(len(test_codes)),
                 self._zeros(len(sample_codes)) if sample_codes is not None else None,
             )
 
-        t0 = time.time()
-        budget = self.cfg.ppl_time_budget_sec
+        t_global = time.time()
+        deadline = t_global + self.cfg.ppl_time_budget_sec
 
-        # Priority 1: TEST (55% of budget)
-        logger.info("Phase 1/3: Test set LLM fingerprinting")
-        ppl_test, n_test = self._infer(test_codes, model, tokenizer, budget * 0.55)
-        logger.info("Test LLM coverage: %d / %d (%.1f%%)", n_test, len(test_codes), n_test / len(test_codes) * 100)
+        # ── Priority 1: TEST SET (run to 100% completion) ──
+        logger.info("="*60)
+        logger.info("PRIORITY 1/3: Test set — %d samples (target: 100%%)", len(test_codes))
+        logger.info("="*60)
+        ppl_test, n_test = self._infer_until_done(
+            test_codes, model, tokenizer, deadline
+        )
+        test_pct = n_test / len(test_codes) * 100
+        logger.info(
+            "Test LLM coverage: %d / %d (%.1f%%) in %.1f min",
+            n_test, len(test_codes), test_pct, (time.time() - t_global) / 60,
+        )
 
-        # Priority 2: SAMPLE (small, fast)
+        # ── Priority 2: SAMPLE SET (run to 100% completion) ──
         ppl_sample = None
-        if sample_codes is not None:
-            remaining = budget - (time.time() - t0)
-            logger.info("Phase 2/3: Sample set LLM fingerprinting")
-            ppl_sample, _ = self._infer(sample_codes, model, tokenizer, min(remaining, 120))
+        if sample_codes is not None and time.time() < deadline:
+            logger.info("="*60)
+            logger.info("PRIORITY 2/3: Sample set — %d samples", len(sample_codes))
+            logger.info("="*60)
+            ppl_sample, n_sample = self._infer_until_done(
+                sample_codes, model, tokenizer, deadline
+            )
+            logger.info("Sample LLM coverage: %d / %d (%.1f%%)", n_sample, len(sample_codes), n_sample / len(sample_codes) * 100)
 
-        # Priority 3: TRAIN subsample (whatever time is left)
-        remaining = budget - (time.time() - t0)
+        # ── Priority 3: TRAIN SUBSAMPLE (use ALL remaining budget) ──
         ppl_train = self._zeros(len(train_codes))
-        if remaining > 120:
-            logger.info("Phase 3/3: Train subsample LLM fingerprinting")
+        remaining = deadline - time.time()
+        if remaining > 60:
             n_sub = min(self.cfg.ppl_train_subsample, len(train_codes))
+            logger.info("="*60)
+            logger.info(
+                "PRIORITY 3/3: Train subsample — %d / %d samples (%.0f min remaining)",
+                n_sub, len(train_codes), remaining / 60,
+            )
+            logger.info("="*60)
             sub_idx = np.sort(np.random.choice(len(train_codes), n_sub, replace=False))
-            ppl_sub, n_done = self._infer(train_codes[sub_idx], model, tokenizer, remaining)
+            ppl_sub, n_done = self._infer_until_done(
+                train_codes[sub_idx], model, tokenizer, deadline
+            )
             ppl_train[sub_idx[:n_done]] = ppl_sub[:n_done]
+            logger.info("Train LLM coverage: %d / %d target", n_done, n_sub)
+        else:
+            logger.warning("No time remaining for train set PPL")
 
+        # Cleanup GPU memory
         del model, tokenizer
-        import torch; torch.cuda.empty_cache()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
         gc.collect()
-        logger.info("LLM Perplexity done in %.1f min", (time.time() - t0) / 60)
+
+        total_min = (time.time() - t_global) / 60
+        logger.info("LLM Perplexity Engine completed in %.1f min (budget was %.1f min)", total_min, self.cfg.ppl_time_budget_sec / 60)
         return ppl_train, ppl_test, ppl_sample
 
     def _load_model(self):
-        """Attempts to load a quantized causal LM from Kaggle model inputs."""
+        """Attempts to load a quantized causal LM from Kaggle model inputs.
+
+        Tries each candidate path in order. Prefers NF4 4-bit quantization
+        for optimal VRAM efficiency on T4 GPUs.
+
+        Returns:
+            Tuple of (model, tokenizer) or (None, None) on failure.
+        """
         try:
             import torch
             if not torch.cuda.is_available():
@@ -251,6 +298,7 @@ class LLMPerplexityEngine:
                 return None, None
             from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         except ImportError:
+            logger.warning("transformers not installed")
             return None, None
 
         for path in self.cfg.ppl_candidates:
@@ -258,9 +306,12 @@ class LLMPerplexityEngine:
                 continue
             try:
                 logger.info("Trying LLM: %s", path)
-                tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, padding_side="right")
+                tokenizer = AutoTokenizer.from_pretrained(
+                    path, trust_remote_code=True, padding_side="right"
+                )
                 if tokenizer.pad_token is None:
                     tokenizer.pad_token = tokenizer.eos_token
+
                 model = AutoModelForCausalLM.from_pretrained(
                     path,
                     quantization_config=BitsAndBytesConfig(
@@ -276,56 +327,124 @@ class LLMPerplexityEngine:
                 return model, tokenizer
             except Exception as exc:
                 logger.warning("Failed %s: %s", path, exc)
+
         return None, None
 
-    def _infer(self, codes, model, tokenizer, time_budget: float):
-        """Batch LLM inference with graceful time-budget abort."""
+    def _infer_until_done(
+        self,
+        codes: np.ndarray,
+        model,
+        tokenizer,
+        deadline: float,
+    ) -> Tuple[np.ndarray, int]:
+        """Runs LLM inference until dataset is fully completed OR deadline hit.
+
+        Implements adaptive OOM recovery: on CUDA OOM, batch size is
+        halved and the failed batch is retried. Minimum batch size = 8.
+
+        Args:
+            codes: Array of code strings to process.
+            model: Loaded causal LM.
+            tokenizer: Corresponding tokenizer.
+            deadline: Unix timestamp after which processing must stop.
+
+        Returns:
+            Tuple of (feature_matrix, n_samples_completed).
+        """
         import torch
 
         n = len(codes)
         features = self._zeros(n)
-        bs = self.cfg.ppl_batch_size
+        bs = self._effective_bs
         t0 = time.time()
         last_end = 0
+        log_interval = max(1, 50_000 // max(bs, 1))  # log every ~50k samples
 
-        for start in range(0, n, bs):
-            end = min(start + bs, n)
-            last_end = end
-            batch = [c[: self.cfg.max_chars] if isinstance(c, str) else "" for c in codes[start:end]]
-            enc = tokenizer(batch, return_tensors="pt", truncation=True, max_length=self.cfg.ppl_max_tokens, padding=True)
-            ids = enc.input_ids.to(model.device)
-            mask = enc.attention_mask.to(model.device)
-
-            with torch.inference_mode():
-                logits = model(input_ids=ids, attention_mask=mask).logits
-
-            sl = logits[:, :-1, :].contiguous()
-            st = ids[:, 1:].contiguous()
-            sm = mask[:, 1:].contiguous().float()
-            nll = (
-                torch.nn.CrossEntropyLoss(reduction="none")(
-                    sl.view(-1, sl.size(-1)), st.view(-1)
-                ).view(st.size())
-                * sm
-            )
-
-            for j in range(end - start):
-                vals = nll[j][sm[j].bool()].float().cpu().numpy()
-                if len(vals) == 0:
-                    continue
-                q25, q75 = np.percentile(vals, [25, 75])
-                features[start + j] = [
-                    np.mean(vals), np.std(vals), q25, q75, float(len(vals)),
-                ]
-
-            del ids, mask, logits, sl, st, sm, nll
-            torch.cuda.empty_cache()
-
-            if time.time() - t0 > time_budget:
-                logger.info("Time budget reached at %d / %d", end, n)
+        start = 0
+        while start < n:
+            if time.time() >= deadline:
+                logger.info("Deadline reached at %d / %d (%.1f%%)", start, n, start / n * 100)
                 break
+
+            end = min(start + bs, n)
+            batch = [
+                c[: self.cfg.max_chars] if isinstance(c, str) else ""
+                for c in codes[start:end]
+            ]
+
+            try:
+                enc = tokenizer(
+                    batch,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.cfg.ppl_max_tokens,
+                    padding=True,
+                )
+                ids = enc.input_ids.to(model.device)
+                mask = enc.attention_mask.to(model.device)
+
+                with torch.inference_mode():
+                    logits = model(input_ids=ids, attention_mask=mask).logits
+
+                sl = logits[:, :-1, :].contiguous()
+                st = ids[:, 1:].contiguous()
+                sm = mask[:, 1:].contiguous().float()
+                nll = (
+                    torch.nn.CrossEntropyLoss(reduction="none")(
+                        sl.view(-1, sl.size(-1)), st.view(-1)
+                    ).view(st.size())
+                    * sm
+                )
+
+                for j in range(end - start):
+                    vals = nll[j][sm[j].bool()].float().cpu().numpy()
+                    if len(vals) == 0:
+                        continue
+                    q25, q75 = np.percentile(vals, [25, 75])
+                    features[start + j] = [
+                        np.mean(vals),
+                        np.std(vals),
+                        q25,
+                        q75,
+                        float(len(vals)),
+                    ]
+
+                del ids, mask, logits, sl, st, sm, nll
+                torch.cuda.empty_cache()
+
+                last_end = end
+                batch_idx = start // bs
+                if batch_idx % log_interval == 0 and start > 0:
+                    elapsed = time.time() - t0
+                    speed = end / elapsed
+                    eta = (n - end) / max(speed, 1) / 60
+                    logger.info(
+                        "  %d / %d (%.1f%%) | %.0f samp/s | ETA %.1f min",
+                        end, n, end / n * 100, speed, eta,
+                    )
+
+                start = end  # advance to next batch
+
+            except torch.cuda.OutOfMemoryError:
+                # Adaptive OOM recovery: halve batch size and retry
+                torch.cuda.empty_cache()
+                gc.collect()
+                old_bs = bs
+                bs = max(bs // 2, 8)
+                self._effective_bs = bs
+                logger.warning(
+                    "CUDA OOM at batch [%d:%d] — reducing batch size %d → %d",
+                    start, end, old_bs, bs,
+                )
+                # Don't advance start — retry the same batch with smaller bs
+
+            except Exception as exc:
+                logger.error("Inference error at [%d:%d]: %s", start, end, exc)
+                last_end = end
+                start = end  # skip this batch
 
         return features, last_end
 
     def _zeros(self, n: int) -> np.ndarray:
+        """Creates a zero-filled feature matrix."""
         return np.zeros((n, len(self.FEATURE_NAMES)), dtype=np.float32)

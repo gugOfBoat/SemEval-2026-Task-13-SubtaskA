@@ -129,13 +129,25 @@ SemEval-2026-Task-13-SubtaskA/
 
 ---
 
-## Results
+## Performance & Metrics
 
-| Version | Sample F1 | Leaderboard | Key Change |
-|---------|-----------|-------------|------------|
-| v6 (baseline) | 0.679 | ~0.65 | Weighted blend |
-| v9 (stacking) | 0.719 | ~0.68 | K-fold stacking + LLM perplexity |
-| **v10 (CAMSP)** | **TBD** | **Target: 0.70** | Test-first LLM ordering, +5 features, ratio floor |
+**Pipeline Baseline (CAMSP v10)** evaluation on internal `test_sample`:
+
+- **Sample Macro F1**: `0.7135`
+- **Global OOD Ratio**: `0.10`
+- **Adaptive Shrinkage**: `1.00`
+- **Test Set Machine Predictions**: `10.06%` (50,291 / 500,000)
+- **Total Execution Time**: `245.5m` (~4 hours)
+
+### Tuned Language Ratios:
+> Derived via 5-Fold OOF Stack Tuning to prevent minority language collapse.
+
+| Language | Ratio | Language | Ratio |
+|----------|-------|----------|-------|
+| **C#** | `25%` | **Java** | `17%` |
+| **Go** | `26%` | **PHP** | `18%` |
+| **Python** | `22%` | **JavaScript** | `39%` |
+| **C++** | `8%` | **C** | `17%` |
 
 ---
 

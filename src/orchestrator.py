@@ -100,13 +100,8 @@ class CAMSPipeline:
         return [str(x)[: self.cfg.max_chars] if x else "" for x in codes]
 
     def _check_deadline(self, t_start: float, phase: str) -> None:
-        """Raises RuntimeError if pipeline exceeded 8h budget."""
-        elapsed = time.time() - t_start
-        if elapsed > PIPELINE_DEADLINE_SEC:
-            raise RuntimeError(
-                f"Pipeline exceeded {PIPELINE_DEADLINE_SEC/3600:.0f}h budget "
-                f"at phase '{phase}' (elapsed: {elapsed/3600:.1f}h)"
-            )
+        """Deadline guard disabled to allow full 12h Kaggle execution."""
+        pass
 
     def run(self) -> pd.DataFrame:
         """Executes the full CAMSP pipeline end-to-end.

@@ -75,10 +75,10 @@ class PipelineConfig:
     ppl_max_tokens: int = 128
     ppl_batch_size: int = 128
     ppl_train_subsample: int = 50_000
-    ppl_time_budget_sec: int = 23_400  # 6.5 hours
+    ppl_time_budget_sec: int = 25_200  # 7 hours
 
     # --- Stacking Meta-Learner ---
-    n_folds: int = 3
+    n_folds: int = 5
     meta_lr: float = 0.02
     meta_max_iter: int = 500
     meta_max_leaf_nodes: int = 63

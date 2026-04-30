@@ -357,17 +357,30 @@ class CAMSPipeline:
         else:
             tune_cfg = {"global": self.cfg.fallback_global_ratio, "l_map": {}, "shrink": 0.5}
 
+        # ── CRITICAL FIX: Re-tune global ratio for test set WITHOUT language ──
+        # The per-language tuner finds global_ratio=0.05 (irrelevant when shrink=1.0)
+        # but test.parquet has NO language column → ALL test samples use global_ratio.
+        # We must find the optimal single ratio by treating sample as one group.
+        test_has_language = "language" in te_df.columns
+        if not test_has_language and sa_df is not None and meta_sa is not None:
+            fixed_global = self.tuner.tune_global_only(
+                sa_df["label"].values, meta_sa, sa_artifacts,
+            )
+            logger.info(
+                "Test has no language column — overriding global ratio: %.2f → %.2f",
+                tune_cfg["global"], fixed_global,
+            )
+            tune_cfg["global"] = fixed_global
+
         # Apply predictions to test set
-        # test.parquet has NO language column → use global ratio (no per-lang split)
         norm_scores = self.tuner.rank_normalize(meta_te)
-        if te_langs is not None and not np.all(te_langs == "Unknown"):
-            # If language column exists in test, use language-aware predict
+        if test_has_language:
             preds = self.tuner.language_aware_predict(
                 norm_scores, te_langs, tune_cfg["global"], tune_cfg["l_map"], tune_cfg["shrink"],
             )
         else:
-            # No language info → use global ratio only
-            logger.info("Test set has no language column — using global ratio: %.2f", tune_cfg["global"])
+            # No language info → use re-tuned global ratio only
+            logger.info("Test set prediction using global ratio: %.2f", tune_cfg["global"])
             preds = self.tuner.apply_ratio(norm_scores, tune_cfg["global"])
 
         preds[te_artifacts] = 1

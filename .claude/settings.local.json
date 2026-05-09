@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"d:\\\\Lâm\\\\SemEval-2026-Task-13-SubtaskA\" -Recurse -File)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Get-ChildItem -Path \"d:\\\\Lâm\\\\SemEval-2026-Task-13-SubtaskA\" -Recurse -Filter \"*.py\")",
+      "Bash(python -m py_compile src/config.py)",
+      "Bash(python -m py_compile src/data_utils.py)",
+      "Bash(python -m py_compile src/features.py)",
+      "Bash(python -m py_compile src/tuning.py)",
+      "Bash(python -m py_compile src/orchestrator.py)"
+    ]
+  }
+}

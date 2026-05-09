@@ -205,3 +205,100 @@ class OODRatioTuner:
             best_ratio, best_f1,
         )
         return best_ratio
+
+    def tune_global_bayesian(
+        self,
+        sample_labels: np.ndarray,
+        sample_scores: np.ndarray,
+        forced_artifacts: np.ndarray,
+    ) -> float:
+        """Bayesian-smoothed global ratio tuning.
+
+        Finds optimal ratio via grid search, then dampens toward a prior
+        to reduce overfitting to the small test_sample.
+
+        Args:
+            sample_labels: Ground-truth binary labels from test_sample.
+            sample_scores: Raw model scores from the meta-learner.
+            forced_artifacts: Boolean mask of detected hard artifacts.
+
+        Returns:
+            Smoothed global ratio (float).
+        """
+        raw_best = self.tune_global_only(sample_labels, sample_scores, forced_artifacts)
+        if not self.cfg.bayesian_enable:
+            return raw_best
+        smoothed = (
+            self.cfg.bayesian_alpha * raw_best
+            + (1.0 - self.cfg.bayesian_alpha) * self.cfg.bayesian_prior_ratio
+        )
+        smoothed = float(np.clip(smoothed, self.cfg.ratio_floor, self.cfg.ratio_ceil))
+        logger.info(
+            "Bayesian smoothing: raw=%.3f -> smoothed=%.3f (prior=%.3f, alpha=%.2f)",
+            raw_best, smoothed, self.cfg.bayesian_prior_ratio, self.cfg.bayesian_alpha,
+        )
+        return smoothed
+
+    def tune_per_family(
+        self,
+        sample_labels: np.ndarray,
+        sample_scores: np.ndarray,
+        sample_families: np.ndarray,
+        forced_artifacts: np.ndarray,
+    ) -> dict:
+        """Per-family ratio tuning with Bayesian smoothing.
+
+        Args:
+            sample_labels: Ground-truth binary labels from test_sample.
+            sample_scores: Raw model scores from the meta-learner.
+            sample_families: Inferred language family per sample.
+            forced_artifacts: Boolean mask of detected hard artifacts.
+
+        Returns:
+            Dict with keys: global, family_map.
+        """
+        logger.info("Starting per-family Bayesian ratio tuning")
+        norm = self.rank_normalize(sample_scores)
+
+        best_global_f1 = -1.0
+        best_global_ratio = self.cfg.fallback_global_ratio
+        for gr in self.cfg.global_ratio_grid:
+            preds = self.apply_ratio(norm, gr).copy()
+            preds[forced_artifacts] = 1
+            f1 = f1_score(sample_labels, preds, average="macro")
+            if f1 > best_global_f1:
+                best_global_f1 = f1
+                best_global_ratio = float(gr)
+
+        family_map = {}
+        for fam in np.unique(sample_families):
+            idx = np.where(sample_families == fam)[0]
+            if len(idx) < 20:
+                family_map[fam] = best_global_ratio
+                continue
+            best_fam_f1 = -1.0
+            for r in self.cfg.lang_ratio_grid:
+                f1 = f1_score(
+                    sample_labels[idx],
+                    self.apply_ratio(norm[idx], r),
+                    average="macro",
+                )
+                if f1 > best_fam_f1:
+                    best_fam_f1 = f1
+                    family_map[fam] = float(r)
+
+        if self.cfg.bayesian_enable:
+            prior = self.cfg.bayesian_prior_ratio
+            alpha = self.cfg.bayesian_alpha
+            best_global_ratio = float(np.clip(
+                alpha * best_global_ratio + (1.0 - alpha) * prior,
+                self.cfg.ratio_floor, self.cfg.ratio_ceil,
+            ))
+            for fam in family_map:
+                family_map[fam] = float(np.clip(
+                    alpha * family_map[fam] + (1.0 - alpha) * prior,
+                    self.cfg.ratio_floor, self.cfg.ratio_ceil,
+                ))
+
+        logger.info("Per-family ratios: %s | global: %.3f", family_map, best_global_ratio)
+        return {"global": best_global_ratio, "family_map": family_map}

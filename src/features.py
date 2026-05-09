@@ -13,6 +13,7 @@ LLM Engine v10.1 Changes:
 
 import bz2
 import gc
+import lzma
 import logging
 import os
 import subprocess
@@ -81,12 +82,21 @@ class CodeStyleExtractor:
 
         if tb:
             f["bz2_ratio"] = len(bz2.compress(tb, compresslevel=9)) / blen
+            try:
+                f["lzma_ratio"] = len(lzma.compress(tb)) / blen
+            except Exception:
+                f["lzma_ratio"] = 0.0
+            f["zlib_bz2_delta"] = f["zlib_ratio"] - f["bz2_ratio"]
+            f["bz2_lzma_delta"] = f["bz2_ratio"] - f["lzma_ratio"]
             byte_arr = np.frombuffer(tb, dtype=np.uint8)
             cnts = np.bincount(byte_arr, minlength=256)
             probs = cnts[cnts > 0] / byte_arr.size
             f["byte_entropy"] = float(-(probs * np.log2(probs)).sum())
         else:
             f["bz2_ratio"] = 0.0
+            f["lzma_ratio"] = 0.0
+            f["zlib_bz2_delta"] = 0.0
+            f["bz2_lzma_delta"] = 0.0
             f["byte_entropy"] = 0.0
 
         # --- Indentation dynamics ---
@@ -110,6 +120,25 @@ class CodeStyleExtractor:
             f["indent_delta_entropy"] = float(-(pd_ * np.log2(pd_ + 1e-12)).sum())
         else:
             f["indent_delta_entropy"] = 0.0
+
+        # --- Bracket depth statistics ---
+        depth = 0
+        depths = []
+        for ch in code[: self.cfg.max_chars]:
+            if ch in '({[':
+                depth += 1
+            elif ch in ')}]':
+                depth = max(0, depth - 1)
+            depths.append(depth)
+        if depths:
+            d_arr = np.array(depths, dtype=np.float32)
+            f["bracket_depth_mean"] = float(d_arr.mean())
+            f["bracket_depth_max"] = float(d_arr.max())
+            f["bracket_depth_var"] = float(d_arr.var())
+        else:
+            f["bracket_depth_mean"] = 0.0
+            f["bracket_depth_max"] = 0.0
+            f["bracket_depth_var"] = 0.0
 
         # --- Character distribution ---
         cc = max(len(code), 1)
@@ -230,7 +259,7 @@ class LLMPerplexityEngine:
         logger.info("PRIORITY 1/3: Test set — %d samples (target: 100%%)", len(test_codes))
         logger.info("="*60)
         ppl_test, n_test = self._infer_until_done(
-            test_codes, model, tokenizer, deadline
+            test_codes, model, tokenizer, deadline, ckpt_name="ppl_test"
         )
         test_pct = n_test / len(test_codes) * 100
         logger.info(
@@ -245,7 +274,7 @@ class LLMPerplexityEngine:
             logger.info("PRIORITY 2/3: Sample set — %d samples", len(sample_codes))
             logger.info("="*60)
             ppl_sample, n_sample = self._infer_until_done(
-                sample_codes, model, tokenizer, deadline
+                sample_codes, model, tokenizer, deadline, ckpt_name="ppl_sample"
             )
             logger.info("Sample LLM coverage: %d / %d (%.1f%%)", n_sample, len(sample_codes), n_sample / len(sample_codes) * 100)
 
@@ -262,7 +291,7 @@ class LLMPerplexityEngine:
             logger.info("="*60)
             sub_idx = np.sort(np.random.choice(len(train_codes), n_sub, replace=False))
             ppl_sub, n_done = self._infer_until_done(
-                train_codes[sub_idx], model, tokenizer, deadline
+                train_codes[sub_idx], model, tokenizer, deadline, ckpt_name="ppl_train"
             )
             ppl_train[sub_idx[:n_done]] = ppl_sub[:n_done]
             logger.info("Train LLM coverage: %d / %d target", n_done, n_sub)
@@ -336,6 +365,7 @@ class LLMPerplexityEngine:
         model,
         tokenizer,
         deadline: float,
+        ckpt_name: str = None,
     ) -> Tuple[np.ndarray, int]:
         """Runs LLM inference until dataset is fully completed OR deadline hit.
 
@@ -347,6 +377,7 @@ class LLMPerplexityEngine:
             model: Loaded causal LM.
             tokenizer: Corresponding tokenizer.
             deadline: Unix timestamp after which processing must stop.
+            ckpt_name: Optional prefix for incremental checkpoints.
 
         Returns:
             Tuple of (feature_matrix, n_samples_completed).
@@ -360,7 +391,23 @@ class LLMPerplexityEngine:
         last_end = 0
         log_interval = max(1, 50_000 // max(bs, 1))  # log every ~50k samples
 
-        start = 0
+        ckpt_path = None
+        if ckpt_name:
+            ckpt_dir = "/kaggle/working/_ckpt" if os.path.isdir("/kaggle/working") else "/tmp/_ckpt"
+            os.makedirs(ckpt_dir, exist_ok=True)
+            ckpt_path = os.path.join(ckpt_dir, f"{ckpt_name}_incr.npz")
+            if os.path.exists(ckpt_path):
+                try:
+                    ckpt_data = np.load(ckpt_path)
+                    n_done = int(ckpt_data["n_done"])
+                    features[:n_done] = ckpt_data["features"][:n_done]
+                    last_end = n_done
+                    logger.info("Resumed from incremental checkpoint: %s (start=%d)", ckpt_name, n_done)
+                except Exception as exc:
+                    logger.warning("Failed to load incremental checkpoint: %s", exc)
+                    last_end = 0
+
+        start = last_end
         while start < n:
             if time.time() >= deadline:
                 logger.info("Deadline reached at %d / %d (%.1f%%)", start, n, start / n * 100)
@@ -422,6 +469,9 @@ class LLMPerplexityEngine:
                         "  %d / %d (%.1f%%) | %.0f samp/s | ETA %.1f min",
                         end, n, end / n * 100, speed, eta,
                     )
+
+                if ckpt_path and end % self.cfg.ppl_checkpoint_interval < bs:
+                    np.savez_compressed(ckpt_path, features=features, n_done=np.array(end))
 
                 start = end  # advance to next batch
 

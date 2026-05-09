@@ -25,7 +25,7 @@ from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 
 from .config import PipelineConfig
-from .data_utils import ArtifactDetector, DataIngestion, GeneratorFamilyEncoder, set_seed
+from .data_utils import ArtifactDetector, DataIngestion, FamilyInferencer, GeneratorFamilyEncoder, set_seed
 from .features import CodeStyleExtractor, LLMPerplexityEngine
 from .tuning import OODRatioTuner
 
@@ -135,6 +135,21 @@ class CAMSPipeline:
         te_langs = _safe_lang_col(te_df)
         sa_langs = _safe_lang_col(sa_df)
 
+        # Infer language families when no 'language' column exists
+        te_families = None
+        sa_families = None
+        if np.all(te_langs == "Unknown"):
+            logger.info("Inferring language families for test set (no 'language' column)")
+            te_families = FamilyInferencer.infer_batch(te_df["code"].values)
+        else:
+            te_families = te_langs
+
+        if sa_df is not None:
+            if np.all(sa_langs == "Unknown"):
+                sa_families = FamilyInferencer.infer_batch(sa_df["code"].values)
+            else:
+                sa_families = sa_langs
+
         # ── 2. LLM Perplexity (Sequential Completion) ──
         logger.info("=" * 60)
         logger.info("PHASE 2/7: LLM Perplexity")
@@ -170,6 +185,19 @@ class CAMSPipeline:
 
         X_sty_all_ckpt = _load_ckpt("sty_train")
         X_sty_te_ckpt = _load_ckpt("sty_test")
+
+        # Invalidate checkpoints if feature count changed (e.g., new features added)
+        n_ppl = len(LLMPerplexityEngine.FEATURE_NAMES)
+        if X_sty_all_ckpt is not None:
+            sty_probe = self.style_eng._extract_single("x = 1")
+            expected_cols = len(sty_probe) + n_ppl
+            if X_sty_all_ckpt.shape[1] != expected_cols:
+                logger.warning(
+                    "Style checkpoint shape mismatch (%d vs %d) — re-extracting",
+                    X_sty_all_ckpt.shape[1], expected_cols,
+                )
+                X_sty_all_ckpt = None
+                X_sty_te_ckpt = None
 
         if X_sty_all_ckpt is not None and X_sty_te_ckpt is not None:
             logger.info("Style checkpoints found — skipping extraction")
@@ -321,19 +349,43 @@ class CAMSPipeline:
 
         # ── 5. Meta-Learner ──
         logger.info("=" * 60)
-        logger.info("PHASE 5/7: HGB Meta-Learner")
+        logger.info("PHASE 5/7: Meta-Learner")
         logger.info("=" * 60)
 
         Xm_tr = np.column_stack([oof, ppl_tr])
         Xm_te = np.column_stack([te_avg, ppl_te])
         Xm_sa = np.column_stack([sa_avg, ppl_sa]) if sa_avg is not None and ppl_sa is not None else None
 
-        meta = HistGradientBoostingClassifier(
-            learning_rate=self.cfg.meta_lr, max_iter=self.cfg.meta_max_iter,
-            max_leaf_nodes=self.cfg.meta_max_leaf_nodes, min_samples_leaf=50,
-            l2_regularization=1.0, early_stopping=True, validation_fraction=0.1,
-            n_iter_no_change=20, random_state=self.cfg.seed,
-        )
+        meta = None
+        if self.cfg.meta_use_lightgbm:
+            try:
+                import lightgbm as lgb
+                meta = lgb.LGBMClassifier(
+                    boosting_type="gbdt",
+                    extra_trees=self.cfg.meta_lgbm_extra_trees,
+                    n_estimators=self.cfg.meta_lgbm_n_estimators,
+                    num_leaves=self.cfg.meta_lgbm_num_leaves,
+                    learning_rate=self.cfg.meta_lr,
+                    min_child_samples=self.cfg.meta_lgbm_min_child_samples,
+                    reg_lambda=self.cfg.meta_lgbm_reg_lambda,
+                    subsample=self.cfg.meta_lgbm_subsample,
+                    colsample_bytree=self.cfg.meta_lgbm_colsample_bytree,
+                    random_state=self.cfg.seed,
+                    verbose=-1,
+                )
+                logger.info("Meta-learner: LightGBM (extra_trees=%s)", self.cfg.meta_lgbm_extra_trees)
+            except ImportError:
+                logger.warning("LightGBM not available — falling back to HGB")
+
+        if meta is None:
+            meta = HistGradientBoostingClassifier(
+                learning_rate=self.cfg.meta_lr, max_iter=self.cfg.meta_max_iter,
+                max_leaf_nodes=self.cfg.meta_max_leaf_nodes, min_samples_leaf=50,
+                l2_regularization=1.0, early_stopping=True, validation_fraction=0.1,
+                n_iter_no_change=20, random_state=self.cfg.seed,
+            )
+            logger.info("Meta-learner: sklearn HistGradientBoosting")
+
         meta.fit(Xm_tr, y_train)
         meta_te = meta.predict_proba(Xm_te)[:, 1].astype(np.float32)
         meta_sa = meta.predict_proba(Xm_sa)[:, 1].astype(np.float32) if Xm_sa is not None else None
@@ -350,37 +402,50 @@ class CAMSPipeline:
         logger.info("PHASE 6/7: Adaptive Ratio Tuning")
         logger.info("=" * 60)
 
-        # Tune on test_sample (which HAS language column)
-        if sa_df is not None and meta_sa is not None and sa_langs is not None:
-            sa_lang_series = pd.Series(sa_langs).fillna("Unknown").astype(str)
-            tune_cfg = self.tuner.tune(sa_df["label"].values, meta_sa, sa_lang_series, sa_artifacts)
+        # Tune on test_sample with family-aware Bayesian smoothing
+        if sa_df is not None and meta_sa is not None:
+            if sa_families is not None and not np.all(sa_families == "Unknown"):
+                family_tune = self.tuner.tune_per_family(
+                    sa_df["label"].values, meta_sa, sa_families, sa_artifacts,
+                )
+                tune_cfg = {
+                    "global": family_tune["global"],
+                    "l_map": family_tune["family_map"],
+                    "shrink": 0.5,
+                }
+            elif sa_langs is not None:
+                sa_lang_series = pd.Series(sa_langs).fillna("Unknown").astype(str)
+                tune_cfg = self.tuner.tune(
+                    sa_df["label"].values, meta_sa, sa_lang_series, sa_artifacts,
+                )
+            else:
+                tune_cfg = {"global": self.cfg.fallback_global_ratio, "l_map": {}, "shrink": 0.5}
+
+            # Bayesian-smoothed global ratio for language-free test set
+            test_has_language = "language" in te_df.columns
+            if not test_has_language:
+                fixed_global = self.tuner.tune_global_bayesian(
+                    sa_df["label"].values, meta_sa, sa_artifacts,
+                )
+                logger.info("Bayesian global ratio: %.3f (overriding %.3f)", fixed_global, tune_cfg["global"])
+                tune_cfg["global"] = fixed_global
         else:
             tune_cfg = {"global": self.cfg.fallback_global_ratio, "l_map": {}, "shrink": 0.5}
 
-        # ── CRITICAL FIX: Re-tune global ratio for test set WITHOUT language ──
-        # The per-language tuner finds global_ratio=0.05 (irrelevant when shrink=1.0)
-        # but test.parquet has NO language column → ALL test samples use global_ratio.
-        # We must find the optimal single ratio by treating sample as one group.
-        test_has_language = "language" in te_df.columns
-        if not test_has_language and sa_df is not None and meta_sa is not None:
-            fixed_global = self.tuner.tune_global_only(
-                sa_df["label"].values, meta_sa, sa_artifacts,
-            )
-            logger.info(
-                "Test has no language column — overriding global ratio: %.2f → %.2f",
-                tune_cfg["global"], fixed_global,
-            )
-            tune_cfg["global"] = fixed_global
-
         # Apply predictions to test set
+        test_has_language = "language" in te_df.columns
         norm_scores = self.tuner.rank_normalize(meta_te)
         if test_has_language:
             preds = self.tuner.language_aware_predict(
                 norm_scores, te_langs, tune_cfg["global"], tune_cfg["l_map"], tune_cfg["shrink"],
             )
+        elif te_families is not None and not np.all(te_families == "Unknown"):
+            logger.info("Applying family-aware ratios to test set")
+            preds = self.tuner.language_aware_predict(
+                norm_scores, te_families, tune_cfg["global"], tune_cfg["l_map"], tune_cfg["shrink"],
+            )
         else:
-            # No language info → use re-tuned global ratio only
-            logger.info("Test set prediction using global ratio: %.2f", tune_cfg["global"])
+            logger.info("Test set prediction using global ratio: %.3f", tune_cfg["global"])
             preds = self.tuner.apply_ratio(norm_scores, tune_cfg["global"])
 
         preds[te_artifacts] = 1
@@ -406,6 +471,10 @@ class CAMSPipeline:
             if sa_langs is not None and not np.all(sa_langs == "Unknown"):
                 sa_preds = self.tuner.language_aware_predict(
                     sa_norm, sa_langs, tune_cfg["global"], tune_cfg["l_map"], tune_cfg["shrink"],
+                )
+            elif sa_families is not None and not np.all(sa_families == "Unknown"):
+                sa_preds = self.tuner.language_aware_predict(
+                    sa_norm, sa_families, tune_cfg["global"], tune_cfg["l_map"], tune_cfg["shrink"],
                 )
             else:
                 sa_preds = self.tuner.apply_ratio(sa_norm, tune_cfg["global"])

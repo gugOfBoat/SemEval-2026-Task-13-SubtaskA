@@ -10,6 +10,7 @@ import math
 import os
 import random
 import re
+import time
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -203,3 +204,60 @@ class GeneratorFamilyEncoder:
         )
         weights *= len(weights) / weights.sum()
         return weights
+
+
+class FamilyInferencer:
+    """Infers programming language family from code syntax patterns.
+
+    Groups code into broad families (python, c_style, scripting, unknown)
+    to enable family-aware ratio tuning when the 'language' column is absent.
+    """
+
+    _RULES = [
+        ('python', [
+            (re.compile(r'^\s*def\s+\w+\s*\(', re.M), 3),
+            (re.compile(r'^\s*(import|from)\s+\w+', re.M), 2),
+            (re.compile(r'^\s*elif\s+', re.M), 3),
+            (re.compile(r'^\s*class\s+\w+.*:', re.M), 2),
+            (re.compile(r':\s*$', re.M), 1),
+        ]),
+        ('c_style', [
+            (re.compile(r'#include\s*[<"]', re.M), 4),
+            (re.compile(r'\b(int|void|char|double|float)\s+\w+\s*[\(;]'), 3),
+            (re.compile(r'\bstruct\s+\w+\s*\{'), 3),
+            (re.compile(r'^\s*\}', re.M), 1),
+            (re.compile(r'\bpackage\s+\w+'), 2),
+            (re.compile(r'\bpublic\s+(static\s+)?class\b'), 3),
+        ]),
+        ('scripting', [
+            (re.compile(r'\bfunction\s+\w+\s*\('), 3),
+            (re.compile(r'\bconsole\.(log|error|warn)\b'), 3),
+            (re.compile(r'^#!/', re.M), 4),
+            (re.compile(r'\bconst\s+\w+\s*=\s*\(.*\)\s*=>'), 3),
+            (re.compile(r'<\?php'), 4),
+            (re.compile(r'\$\w+\s*='), 2),
+        ]),
+    ]
+
+    @classmethod
+    def infer(cls, code: str) -> str:
+        """Infers language family for a single code sample."""
+        if not isinstance(code, str) or len(code) < 10:
+            return 'unknown'
+        head = '\n'.join(code.split('\n')[:50])
+        scores = {}
+        for family, patterns in cls._RULES:
+            scores[family] = sum(w for rx, w in patterns if rx.search(head))
+        best_fam = max(scores, key=scores.get)
+        return best_fam if scores[best_fam] >= 3 else 'unknown'
+
+    @classmethod
+    def infer_batch(cls, codes: np.ndarray) -> np.ndarray:
+        """Infers language families for an array of code samples."""
+        logger.info("Inferring language families for %d samples", len(codes))
+        t0 = time.time()
+        result = np.array([cls.infer(c) for c in codes], dtype=object)
+        vals, counts = np.unique(result, return_counts=True)
+        dist = dict(zip(vals, counts))
+        logger.info("Family distribution: %s (%.1fs)", dist, time.time() - t0)
+        return result

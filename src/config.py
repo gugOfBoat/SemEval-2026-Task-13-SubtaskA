@@ -76,12 +76,23 @@ class PipelineConfig:
     ppl_batch_size: int = 128
     ppl_train_subsample: int = 50_000
     ppl_time_budget_sec: int = 25_200  # 7 hours
+    ppl_checkpoint_interval: int = 5_000
 
     # --- Stacking Meta-Learner ---
     n_folds: int = 5
     meta_lr: float = 0.02
     meta_max_iter: int = 500
     meta_max_leaf_nodes: int = 63
+
+    # --- Meta-Learner Selection ---
+    meta_use_lightgbm: bool = True
+    meta_lgbm_extra_trees: bool = True
+    meta_lgbm_n_estimators: int = 500
+    meta_lgbm_num_leaves: int = 63
+    meta_lgbm_min_child_samples: int = 50
+    meta_lgbm_reg_lambda: float = 1.0
+    meta_lgbm_subsample: float = 0.8
+    meta_lgbm_colsample_bytree: float = 0.8
 
     # --- OOD Ratio Tuning ---
     ratio_floor: float = 0.05
@@ -96,6 +107,11 @@ class PipelineConfig:
         default_factory=lambda: [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
     )
     fallback_global_ratio: float = 0.22
+
+    # --- Bayesian Ratio Smoothing ---
+    bayesian_prior_ratio: float = 0.22
+    bayesian_alpha: float = 0.7
+    bayesian_enable: bool = True
 
     # --- Internal Lexicons ---
     special_tokens: List[str] = field(default_factory=lambda: [

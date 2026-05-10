@@ -246,23 +246,31 @@ class CAMSPipeline:
         te_sum = np.zeros((n_test, 4), dtype=np.float32)
         sa_sum = np.zeros((n_sample, 4), dtype=np.float32) if n_sample > 0 else None
 
-        # Pre-fit char vocabulary
+        # Pre-fit char vocabulary on a subsample to avoid OOM on 600k samples
         logger.info("Pre-computing char vocabulary")
+        vocab_sub_size = min(200_000, len(tr_full))
+        vocab_idx = np.random.choice(len(tr_full), vocab_sub_size, replace=False)
+        vocab_codes = self._truncate(tr_full.iloc[vocab_idx]["code"].values)
         cv_master = TfidfVectorizer(
             analyzer="char", ngram_range=self.cfg.char_ngram_range,
-            max_features=self.cfg.char_max_features, min_df=3,
+            max_features=self.cfg.char_max_features, min_df=2,
             sublinear_tf=True, lowercase=False, dtype=np.float32,
         )
-        cv_master.fit(self._truncate(tr_full["code"].values))
+        cv_master.fit(vocab_codes)
         char_vocab = cv_master.vocabulary_
-        del cv_master
+        del cv_master, vocab_codes, vocab_idx
         gc.collect()
+        logger.info("Char vocab size: %d (fitted on %d samples)", len(char_vocab), vocab_sub_size)
 
         wv = HashingVectorizer(
             analyzer="word", token_pattern=r"\b\w+\b", ngram_range=(1, 3),
             n_features=self.cfg.word_hash_features, alternate_sign=False,
             lowercase=False, norm="l2", dtype=np.float32,
         )
+
+        # Pre-truncate test/sample once to avoid repeated list allocations in fold loop
+        te_codes_trunc = self._truncate(te_df["code"].values)
+        sa_codes_trunc = self._truncate(sa_df["code"].values) if sa_df is not None else None
 
         skf = StratifiedKFold(n_splits=self.cfg.n_folds, shuffle=True, random_state=self.cfg.seed)
         for fi, (tr_idx, va_idx) in enumerate(skf.split(np.zeros(n_train), y_train)):
@@ -271,47 +279,62 @@ class CAMSPipeline:
 
             y_tr = y_train[tr_idx]
             fw_tr = fw_train[tr_idx]
-            fold_codes = tr_full.iloc[tr_idx]["code"].values
+            fold_codes = self._truncate(tr_full.iloc[tr_idx]["code"].values)
+            val_codes = self._truncate(tr_full.iloc[va_idx]["code"].values)
 
-            # Base 1+2: Char TF-IDF
+            # Base 1+2: Char TF-IDF — transform one matrix at a time to bound peak RAM
             cv = TfidfVectorizer(
                 analyzer="char", ngram_range=self.cfg.char_ngram_range,
                 vocabulary=char_vocab, sublinear_tf=True, lowercase=False, dtype=np.float32,
             )
-            Xct = cv.fit_transform(self._truncate(fold_codes))
-            Xcv = cv.transform(self._truncate(tr_full.iloc[va_idx]["code"].values))
-            Xce = cv.transform(self._truncate(te_df["code"].values))
-            Xcs = cv.transform(self._truncate(sa_df["code"].values)) if sa_df is not None else None
+            Xct = cv.fit_transform(fold_codes)
 
             c1 = SGDClassifier(loss="log_loss", alpha=self.cfg.text_alpha, max_iter=self.cfg.text_max_iter, tol=1e-3, random_state=self.cfg.seed)
             c1.fit(Xct, y_tr)
-            oof[va_idx, 0] = c1.decision_function(Xcv).astype(np.float32)
-            te_sum[:, 0] += c1.decision_function(Xce).astype(np.float32)
-            if Xcs is not None:
-                sa_sum[:, 0] += c1.decision_function(Xcs).astype(np.float32)
-
             c2 = SGDClassifier(loss="log_loss", alpha=self.cfg.text_alpha * 1.5, max_iter=self.cfg.text_max_iter, tol=1e-3, random_state=self.cfg.seed)
             c2.fit(Xct, y_tr, sample_weight=fw_tr)
+            del Xct
+            gc.collect()
+
+            Xcv = cv.transform(val_codes)
+            oof[va_idx, 0] = c1.decision_function(Xcv).astype(np.float32)
             oof[va_idx, 1] = c2.decision_function(Xcv).astype(np.float32)
+            del Xcv
+
+            Xce = cv.transform(te_codes_trunc)
+            te_sum[:, 0] += c1.decision_function(Xce).astype(np.float32)
             te_sum[:, 1] += c2.decision_function(Xce).astype(np.float32)
-            if Xcs is not None:
+            del Xce
+
+            if sa_codes_trunc is not None:
+                Xcs = cv.transform(sa_codes_trunc)
+                sa_sum[:, 0] += c1.decision_function(Xcs).astype(np.float32)
                 sa_sum[:, 1] += c2.decision_function(Xcs).astype(np.float32)
-            del Xct, Xcv, Xce, Xcs, c1, c2, cv
+                del Xcs
+
+            del c1, c2, cv
             gc.collect()
 
             # Base 3: Word hash
-            Xwt = wv.transform(self._truncate(fold_codes))
-            Xwv = wv.transform(self._truncate(tr_full.iloc[va_idx]["code"].values))
-            Xwe = wv.transform(self._truncate(te_df["code"].values))
-            Xws = wv.transform(self._truncate(sa_df["code"].values)) if sa_df is not None else None
-
+            Xwt = wv.transform(fold_codes)
             c3 = SGDClassifier(loss="log_loss", alpha=self.cfg.text_alpha, max_iter=self.cfg.text_max_iter, tol=1e-3, random_state=self.cfg.seed)
             c3.fit(Xwt, y_tr)
+            del Xwt
+
+            Xwv = wv.transform(val_codes)
             oof[va_idx, 2] = c3.decision_function(Xwv).astype(np.float32)
+            del Xwv
+
+            Xwe = wv.transform(te_codes_trunc)
             te_sum[:, 2] += c3.decision_function(Xwe).astype(np.float32)
-            if Xws is not None:
+            del Xwe
+
+            if sa_codes_trunc is not None:
+                Xws = wv.transform(sa_codes_trunc)
                 sa_sum[:, 2] += c3.decision_function(Xws).astype(np.float32)
-            del Xwt, Xwv, Xwe, Xws, c3
+                del Xws
+
+            del c3, fold_codes, val_codes
             gc.collect()
 
             # Base 4: Style HGB
